@@ -167,6 +167,56 @@ bot.TELEGRAM_TOPIC_ID = ""
 check("sem topico nao injecta nada", "message_thread_id" not in bot.with_topic(msg))
 
 
+# ── 3b. Botoes ────────────────────────────────────────────────────
+print("\n[3b] Botoes inline")
+
+rows = bot.build_buttons(p)
+flat = [b for r in rows for b in r]
+urls = " ".join(b["url"] for b in flat)
+
+check("3 linhas de botoes", len(rows) == 3, f"got {len(rows)}")
+check("5 botoes no total", len(flat) == 5, f"got {len(flat)}")
+check("TradingView presente", "tradingview.com/symbols/ACME/" in urls)
+check("SEC filing presente", "sec.gov/Archives/edgar/data/999001" in urls)
+check("Investing.com presente", "investing.com/search/?q=ACME" in urls)
+check("Finviz do ticker presente", "finviz.com/quote.ashx?t=ACME" in urls)
+check("Finviz ultimas compras presente", "finviz.com/insidertrading?tc=7" in urls)
+check("todos os botoes tem texto e url",
+      all(b.get("text") and b.get("url") for b in flat))
+check("nenhum texto excede 64 chars (limite Telegram)",
+      all(len(b["text"]) <= 64 for b in flat),
+      str([len(b["text"]) for b in flat]))
+
+# Tickers com pontos/hifens (BRK.B, BF-B) tem de ir encoded
+dotted = dict(p, ticker="BRK.B")
+durls = " ".join(b["url"] for r in bot.build_buttons(dotted) for b in r)
+check("ticker com ponto vai URL-encoded", "q=BRK%2EB" in durls or "q=BRK.B" in durls, durls)
+check("ponto nao quebra o path do TradingView", "symbols/BRK" in durls)
+
+
+# ── 3c. Penalizacao 10b5-1 ────────────────────────────────────────
+print("\n[3c] Penalizacao opcional de planos 10b5-1")
+
+plan = bot.parse_filing(PLAN_10B5)
+tmp_conn = bot.init_db(os.path.join(tempfile.mkdtemp(), "p.db"))
+
+bot.SCORE_PENALTY_10B5 = 0
+s_off, w_off = bot.calculate_score(plan, tmp_conn)
+check("default nao penaliza", "10b5-1" not in " ".join(w_off), str(w_off))
+
+bot.SCORE_PENALTY_10B5 = 2
+s_on, w_on = bot.calculate_score(plan, tmp_conn)
+check("penalizacao aplicada", s_on == s_off - 2, f"{s_off} -> {s_on}")
+check("penalizacao aparece no breakdown", "-2 plano 10b5-1" in " ".join(w_on))
+
+bot.SCORE_PENALTY_10B5 = 99
+s_floor, _ = bot.calculate_score(plan, tmp_conn)
+check("score nunca fica negativo", s_floor == 0, f"got {s_floor}")
+
+bot.SCORE_PENALTY_10B5 = 0
+tmp_conn.close()
+
+
 # ── 4. Scoring e cluster ──────────────────────────────────────────
 print("\n[4] Scoring e deteccao de cluster")
 

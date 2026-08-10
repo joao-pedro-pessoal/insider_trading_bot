@@ -36,7 +36,8 @@ import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -81,6 +82,12 @@ CLUSTER_WINDOW_DAYS       = _env_int("CLUSTER_WINDOW_DAYS", 7)
 SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 1)   # abaixo disto nem envia
 SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 3)  # envia sem notificacao
 SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 6)
+
+# Penalizacao para compras feitas ao abrigo de um plano 10b5-1: foram agendadas
+# com meses de antecedencia, logo dizem muito menos sobre a visao actual do
+# insider. Default 0 (sem penalizacao) para nao mudar o comportamento sem
+# escolha tua -- por 2 ou 3 se quiseres que planos automaticos desçam no ranking.
+SCORE_PENALTY_10B5        = _env_int("SCORE_PENALTY_10B5", 0)
 
 # Janela de lookback. Dedup por accession torna a sobreposicao inofensiva,
 # por isso vale a pena ser generoso: uma corrida falhada nao perde filings.
@@ -492,7 +499,11 @@ def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]
         score += 3
         why.append(f"+3 cluster ({cluster} insider(s))")
 
-    return score, why
+    if txn.get("is_10b5") and SCORE_PENALTY_10B5:
+        score -= SCORE_PENALTY_10B5
+        why.append(f"-{SCORE_PENALTY_10B5} plano 10b5-1")
+
+    return max(score, 0), why
 
 
 def count_cluster_insiders(conn: sqlite3.Connection, txn: dict) -> int:
@@ -530,6 +541,44 @@ def esc(value: Any) -> str:
     """Escapa & < > para parse_mode=HTML. A v1.0 tinha um escaper de
     MarkdownV2 que nunca era chamado -- qualquer 'Procter & Gamble' dava 400."""
     return html.escape(str(value), quote=False)
+
+
+# Feed global das ultimas compras de insiders no Finviz (tc=7 = latest buys).
+FINVIZ_LATEST_BUYS = os.environ.get(
+    "FINVIZ_INSIDER_URL", "https://finviz.com/insidertrading?tc=7"
+)
+
+
+def build_buttons(txn: dict) -> list[list[dict]]:
+    """
+    Teclado inline, 3 linhas:
+      1. TradingView (grafico)     | Filing SEC (fonte primaria)
+      2. Investing.com (noticias)  | Finviz (fundamentais + historico insider)
+      3. Ultimas compras de insiders no mercado (link global)
+
+    Os tickers vao URL-encoded: ha tickers com pontos (BRK.B) e hifens
+    (BF-B) que quebrariam a query string.
+    """
+    ticker = txn["ticker"]
+    t = quote(ticker, safe="")
+
+    return [
+        [
+            {"text": f"\U0001F4C8 {ticker} TradingView",
+             "url": f"https://www.tradingview.com/symbols/{t}/"},
+            {"text": "\U0001F4C4 Filing SEC", "url": txn["sec_url"]},
+        ],
+        [
+            {"text": "\U0001F4F0 Investing.com",
+             "url": f"https://www.investing.com/search/?q={t}"},
+            {"text": "\U0001F50D Finviz",
+             "url": f"https://finviz.com/quote.ashx?t={t}"},
+        ],
+        [
+            {"text": "\U0001F440 Ultimas compras de insiders",
+             "url": FINVIZ_LATEST_BUYS},
+        ],
+    ]
 
 
 def build_message(txn: dict, score: int, why: list[str]) -> dict:
@@ -580,13 +629,7 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
         "<i>Nao e conselho financeiro. Sinal nao testado historicamente.</i>",
     ]
 
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": f"\U0001F4CA {ticker} no TradingView",
-             "url": f"https://www.tradingview.com/symbols/{ticker}/"},
-            {"text": "\U0001F4C4 Filing SEC", "url": txn["sec_url"]},
-        ]]
-    }
+    keyboard = {"inline_keyboard": build_buttons(txn)}
 
     return {
         "chat_id": TELEGRAM_CHAT_ID,

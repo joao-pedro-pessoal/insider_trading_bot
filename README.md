@@ -22,7 +22,7 @@ Alertas no Telegram sobre compras de mercado aberto (Form 4, código `P`) report
 | 10 | `while True` no Colab — morre quando a runtime desconecta | Um ciclo por invocação (`--once`), com `--loop` opcional |
 | 11 | Chaves hardcoded no ficheiro | Tudo via variáveis de ambiente |
 
-Extras: retry com backoff exponencial, tratamento do flood limit do Telegram, breakdown do score em cada alerta (`+3 CEO/CFO, +3 valor >= $500k`), filtro de `acquiredDisposedCode` para não deixar passar disposições, `--dry-run`, e 38 testes com fixtures.
+Extras: retry com backoff exponencial, tratamento do flood limit do Telegram, breakdown do score em cada alerta (`+3 CEO/CFO, +3 valor >= $500k`), filtro de `acquiredDisposedCode` para não deixar passar disposições, `--dry-run`, e 57 testes com fixtures.
 
 ---
 
@@ -110,7 +110,19 @@ Todas as variáveis são opcionais menos as três chaves.
 | `LOOKBACK_MINUTES` | `90` | janela de busca |
 | `MAX_PAGES` | `6` | páginas de 50 filings por corrida |
 | `TELEGRAM_TOPIC_ID` | — | tópico de destino em supergrupos com forum |
+| `SCORE_PENALTY_10B5` | `0` | pontos a subtrair a compras de plano 10b5-1 |
+| `FINVIZ_INSIDER_URL` | `finviz.com/insidertrading?tc=7` | link do botão de últimas compras |
 | `VERBOSE` | `false` | logging DEBUG |
+
+### Botões de cada alerta
+
+| Botão | Para quê |
+|---|---|
+| 📈 TradingView | gráfico do ticker |
+| 📄 Filing SEC | fonte primária, o Form 4 em si |
+| 📰 Investing.com | notícias e contexto da empresa |
+| 🔍 Finviz | fundamentais + histórico de insider do ticker |
+| 👀 Últimas compras de insiders | feed global de compras recentes no mercado |
 
 ## Scoring
 
@@ -131,7 +143,7 @@ Cada alerta traz o breakdown para poderes auditar porque apareceu.
 
 ```bash
 pip install -r requirements.txt
-python test_bot.py                              # 38 testes, sem rede
+python test_bot.py                              # 57 testes, sem rede
 
 export SEC_API_KEY="..."
 python insider_bot.py --dry-run --lookback 240  # dados reais, imprime em vez de enviar
