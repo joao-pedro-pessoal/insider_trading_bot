@@ -3,22 +3,30 @@ name: Insider Alert Bot
 on:
   schedule:
     # Horas em UTC. Nova Iorque = UTC-4 (verao) / UTC-5 (inverno).
-    # Cobertura desenhada para verao (EDT); no inverno desloca-se 1h — o
-    # lookback de 90min absorve isso sem perder filings.
+    #
+    # Orcamento: ~28 corridas por dia util, ~590/mes. A ~1-2 min facturados
+    # cada, fica em 600-1200 dos 2000 min/mes incluidos no plano Free.
+    #
+    # A frequencia e deliberadamente baixa: o Form 4 tem prazo de entrega de
+    # 2 dias uteis e fica publico para todos ao mesmo tempo. Chegar 20 minutos
+    # depois nao muda nada num sinal de horizonte de meses. O lookback
+    # adaptativo garante que intervalos maiores nao perdem filings.
 
-    # Pre-abertura + mercado aberto: 13:00-20:00 UTC (09:00-16:00 ET), a cada 15min
-    - cron: "*/15 13-20 * * 1-5"
-    # Pos-fecho, pico de entrega de Form 4: 20:00-23:00 UTC (16:00-19:00 ET), a cada 10min
-    - cron: "*/10 20-22 * * 1-5"
-    # Varredura de seguranca fora de horas, 1x/hora
-    - cron: "17 0-12,23 * * 1-5"
+    # Mercado aberto: 13:00-19:59 UTC (09:00-15:59 ET), a cada 30min = 14
+    - cron: "*/30 13-19 * * 1-5"
+    # Pos-fecho, pico real de entrega: 20:00-22:59 UTC (16:00-18:59 ET), a cada 15min = 12
+    - cron: "*/15 20-22 * * 1-5"
+    # Apanha o resto da noite americana (filings ate as 22:00 ET) = 1
+    - cron: "25 2 * * 2-6"
+    # Catch-up de sabado para os filings de sexta a noite = 1
+    - cron: "25 5 * * 6"
 
   workflow_dispatch:
     inputs:
       lookback:
-        description: "Minutos de lookback"
+        description: "Forcar janela em minutos (vazio = automatico)"
         required: false
-        default: "180"
+        default: ""
       dry_run:
         description: "true = nao envia para o Telegram"
         required: false
@@ -68,16 +76,27 @@ jobs:
       - name: Correr o bot
         env:
           SEC_API_KEY:      ${{ secrets.SEC_API_KEY }}
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
           MIN_TRANSACTION_VALUE_USD: "25000"
           CLUSTER_WINDOW_DAYS: "7"
           SCORE_MIN_TO_SEND: "1"
-          LOOKBACK_MINUTES: ${{ github.event.inputs.lookback || '90' }}
+          # Por 2 ou 3 para despromover compras de plano automatico 10b5-1
+          SCORE_PENALTY_10B5: "0"
+          # Mensagens de inicio/fim de ciclo: always | summary | errors | off
+          STATUS_MESSAGES: "always"
+          # Topico separado para o estado (vazio = junto dos alertas)
+          STATUS_TOPIC_ID: ${{ secrets.STATUS_TOPIC_ID }}
+          # Arranque a frio apenas; depois a janela e calculada da ultima corrida
+          LOOKBACK_MINUTES: "90"
         run: |
           ARGS="--db state/alerts.db"
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ github.event.inputs.lookback }}" ]; then
+            ARGS="$ARGS --lookback ${{ github.event.inputs.lookback }}"
           fi
           python insider_bot.py $ARGS
 
@@ -102,11 +121,14 @@ jobs:
           git commit -m "estado: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 0
           git push --force origin HEAD:bot-state
 
-      - name: Guardar DB como artifact (backup)
-        if: always()
+      # Artifact so em falha. Guardar em cada corrida criava ~900 artifacts
+      # vivos ao mesmo tempo e estourava os 500 MB de storage do plano Free.
+      # O branch bot-state ja e o backup do dia-a-dia.
+      - name: Guardar DB como artifact (so em falha)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: alerts-db-${{ github.run_id }}
           path: state/alerts.db
-          retention-days: 14
+          retention-days: 5
           if-no-files-found: ignore
