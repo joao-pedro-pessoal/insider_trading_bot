@@ -330,6 +330,86 @@ check("paginou e parou no cutoff", len(result) == 51, f"got {len(result)}")
 check("nao incluiu o filing antigo",
       all(f["accessionNo"] != "antigo" for f in result))
 
+
+# ── 6. Lookback adaptativo ────────────────────────────────────────
+print("\n[6] Lookback adaptativo")
+
+lb_db = os.path.join(tempfile.mkdtemp(), "lb.db")
+lb = bot.init_db(lb_db)
+
+mins, why = bot.compute_lookback(lb)
+check("arranque a frio usa o default",
+      mins == bot.LOOKBACK_MINUTES and "primeira corrida" in why, f"{mins} / {why}")
+
+mins, why = bot.compute_lookback(lb, override=240)
+check("--lookback tem prioridade", mins == 240 and "forcado" in why, f"{mins} / {why}")
+
+# 40 minutos desde a ultima corrida -> 40 + buffer
+now = _dt.datetime.now(_dt.timezone.utc)
+bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(minutes=40)).isoformat())
+mins, why = bot.compute_lookback(lb)
+check("cobre o intervalo + margem",
+      40 + bot.LOOKBACK_BUFFER_MINUTES - 1 <= mins <= 40 + bot.LOOKBACK_BUFFER_MINUTES + 1,
+      f"{mins} / {why}")
+
+# Fim de semana: 60h de intervalo
+bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(hours=60)).isoformat())
+mins, why = bot.compute_lookback(lb)
+check("intervalo de fim de semana coberto", mins > 3000, f"{mins} / {why}")
+
+# 10 dias parado -> trunca no teto
+bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(days=10)).isoformat())
+mins, why = bot.compute_lookback(lb)
+check("trunca no maximo",
+      mins == bot.MAX_LOOKBACK_MINUTES and "truncado" in why, f"{mins} / {why}")
+
+# Estado corrompido nao deve rebentar
+bot.set_meta(lb, bot.LAST_RUN_KEY, "isto-nao-e-uma-data")
+mins, why = bot.compute_lookback(lb)
+check("estado ilegivel cai no default",
+      mins == bot.LOOKBACK_MINUTES and "ilegivel" in why, f"{mins} / {why}")
+
+# Relogio para tras (last_run no futuro)
+bot.set_meta(lb, bot.LAST_RUN_KEY, (now + _dt.timedelta(hours=2)).isoformat())
+mins, why = bot.compute_lookback(lb)
+check("relogio inconsistente cai no default",
+      mins == bot.LOOKBACK_MINUTES, f"{mins} / {why}")
+
+# Paginas escalam com a janela, mas com teto
+check("janela curta usa paginas base", bot.pages_for(90) == bot.MAX_PAGES)
+check("janela longa pede mais paginas", bot.pages_for(3000) > bot.MAX_PAGES)
+check("paginas tem teto", bot.pages_for(100000) == bot.MAX_PAGES_CATCHUP)
+
+check("meta le e escreve", bot.get_meta(lb, "inexistente") is None)
+lb.close()
+
+
+# ── 7. Mensagens de estado ────────────────────────────────────────
+print("\n[7] Mensagens de estado")
+
+sent = []
+bot.send_telegram = lambda p, dry_run=False: sent.append(p) or True
+
+bot.STATUS_MESSAGES = "always"
+bot.STATUS_TOPIC_ID = "7"
+bot.send_status("teste")
+check("estado enviado", len(sent) == 1)
+check("estado e silencioso", sent[0]["disable_notification"] is True)
+check("estado vai para o topico proprio", sent[0]["message_thread_id"] == 7)
+
+bot.STATUS_TOPIC_ID = ""
+bot.TELEGRAM_TOPIC_ID = "3"
+sent.clear()
+bot.send_status("teste")
+check("sem topico de estado usa o dos alertas",
+      "message_thread_id" not in sent[0], str(sent[0].get("message_thread_id")))
+
+check("duracao formatada em segundos", bot._fmt_duration(42) == "42s")
+check("duracao formatada em minutos", bot._fmt_duration(150) == "2.5min")
+
+bot.STATUS_MESSAGES = "off"
+bot.TELEGRAM_TOPIC_ID = ""
+
 conn.close()
 
 

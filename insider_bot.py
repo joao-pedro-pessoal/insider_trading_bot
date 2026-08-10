@@ -73,6 +73,16 @@ SEC_API_KEY      = os.environ.get("SEC_API_KEY", "")
 # Descobre-se no message_thread_id de uma mensagem enviada nesse topico.
 TELEGRAM_TOPIC_ID = os.environ.get("TELEGRAM_TOPIC_ID", "").strip()
 
+# Mensagens de estado (inicio/fim de ciclo):
+#   "always"  - sempre, mesmo em ciclos sem alertas
+#   "summary" - so a de fim, e apenas se houve alertas ou erro
+#   "errors"  - so quando algo falha
+#   "off"     - nunca
+STATUS_MESSAGES = os.environ.get("STATUS_MESSAGES", "off").strip().lower()
+
+# Topico separado para as mensagens de estado. Vazio = mesmo topico dos alertas.
+STATUS_TOPIC_ID = os.environ.get("STATUS_TOPIC_ID", "").strip()
+
 SEC_API_ENDPOINT = os.environ.get("SEC_API_ENDPOINT", "https://api.sec-api.io/insider-trading")
 
 DB_PATH = os.environ.get("DB_PATH", "state/alerts.db")
@@ -89,12 +99,21 @@ SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 6)
 # escolha tua -- por 2 ou 3 se quiseres que planos automaticos desçam no ranking.
 SCORE_PENALTY_10B5        = _env_int("SCORE_PENALTY_10B5", 0)
 
-# Janela de lookback. Dedup por accession torna a sobreposicao inofensiva,
-# por isso vale a pena ser generoso: uma corrida falhada nao perde filings.
-LOOKBACK_MINUTES = _env_int("LOOKBACK_MINUTES", 90)
+# Lookback de arranque a frio (sem estado anterior na DB). Em corridas normais
+# a janela e calculada a partir da ultima corrida bem sucedida.
+LOOKBACK_MINUTES        = _env_int("LOOKBACK_MINUTES", 90)
+# Margem somada ao intervalo desde a ultima corrida, para absorver os atrasos
+# do cron do GitHub (tipicamente 5-20 min).
+LOOKBACK_BUFFER_MINUTES = _env_int("LOOKBACK_BUFFER_MINUTES", 25)
+# Teto do catch-up. 3 dias cobre um fim de semana inteiro mais folga; mais do
+# que isso significa que o bot esteve dias parado e nao vale a pena inundar.
+MAX_LOOKBACK_MINUTES    = _env_int("MAX_LOOKBACK_MINUTES", 4320)
 
-PAGE_SIZE      = 50           # maximo da SEC-API
-MAX_PAGES      = _env_int("MAX_PAGES", 6)
+PAGE_SIZE         = 50        # maximo da SEC-API
+MAX_PAGES         = _env_int("MAX_PAGES", 6)
+# Teto de paginas em modo catch-up. Cada pagina e 1 pedido a SEC-API, por isso
+# isto e tambem o travao de consumo do teu plano.
+MAX_PAGES_CATCHUP = _env_int("MAX_PAGES_CATCHUP", 30)
 HTTP_TIMEOUT   = 25
 MAX_RETRIES    = 3
 
@@ -144,7 +163,16 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 CREATE INDEX IF NOT EXISTS idx_txn_ticker_date
     ON transactions (ticker, trade_date);
+
+-- Estado do proprio bot. Guarda a hora da ultima corrida bem sucedida para
+-- o lookback poder ser calculado em vez de fixo.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+LAST_RUN_KEY = "last_successful_run_utc"
 
 
 def init_db(path: str = DB_PATH) -> sqlite3.Connection:
@@ -200,6 +228,59 @@ def record_alert(conn: sqlite3.Connection, txn: dict, score: int) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    cur = conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def compute_lookback(conn: sqlite3.Connection,
+                     override: Optional[int] = None) -> tuple[int, str]:
+    """
+    Lookback adaptativo: cobre desde a ultima corrida bem sucedida, com margem.
+
+    Um lookback fixo perde filings sempre que uma corrida falha, atrasa, ou
+    quando ha um intervalo grande entre crons (sexta a noite -> segunda).
+    Calcular a partir da ultima corrida fecha essa classe de furos toda.
+    """
+    if override is not None:
+        return override, "forcado por --lookback"
+
+    last = get_meta(conn, LAST_RUN_KEY)
+    if not last:
+        return LOOKBACK_MINUTES, "primeira corrida (sem estado anterior)"
+
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return LOOKBACK_MINUTES, f"estado ilegivel ({last!r})"
+
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+
+    gap = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+    if gap < 0:
+        return LOOKBACK_MINUTES, "relogio inconsistente"
+
+    minutes = int(gap) + LOOKBACK_BUFFER_MINUTES
+    if minutes > MAX_LOOKBACK_MINUTES:
+        return (MAX_LOOKBACK_MINUTES,
+                f"intervalo de {gap / 60:.1f}h truncado ao maximo")
+    return max(minutes, 15), f"desde a ultima corrida ({gap:.0f}min atras)"
+
+
+def pages_for(lookback_minutes: int) -> int:
+    """Paginas a buscar. Uma janela maior precisa de mais paginas, senao o
+    catch-up trunca silenciosamente e volta a perder filings."""
+    needed = max(MAX_PAGES, int(lookback_minutes / 30))
+    return min(needed, MAX_PAGES_CATCHUP)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -643,8 +724,9 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
 
 def with_topic(payload: dict) -> dict:
     """Encaminha para um topico especifico se TELEGRAM_TOPIC_ID estiver definido.
-    Em supergrupos com forum, sem isto tudo cai no topico General."""
-    if not TELEGRAM_TOPIC_ID:
+    Em supergrupos com forum, sem isto tudo cai no topico General.
+    Um message_thread_id ja presente no payload tem prioridade."""
+    if "message_thread_id" in payload or not TELEGRAM_TOPIC_ID:
         return payload
     try:
         return {**payload, "message_thread_id": int(TELEGRAM_TOPIC_ID)}
@@ -706,23 +788,65 @@ def send_plain(text: str, dry_run: bool = False) -> None:
     }, dry_run=dry_run)
 
 
+def send_status(text: str, dry_run: bool = False) -> None:
+    """Mensagem de estado. Sempre silenciosa (sao ~2 por corrida; com
+    notificacao seria insuportavel) e opcionalmente num topico separado."""
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "disable_notification": True,
+    }
+    if STATUS_TOPIC_ID:
+        try:
+            payload["message_thread_id"] = int(STATUS_TOPIC_ID)
+        except ValueError:
+            log.warning("STATUS_TOPIC_ID='%s' nao e um numero - ignorado", STATUS_TOPIC_ID)
+    send_telegram(payload, dry_run=dry_run)
+
+
+def _fmt_duration(seconds: float) -> str:
+    return f"{seconds:.0f}s" if seconds < 60 else f"{seconds / 60:.1f}min"
+
+
 # ══════════════════════════════════════════════════════════════════
 #  CICLO
 # ══════════════════════════════════════════════════════════════════
 
-def process_cycle(conn: sqlite3.Connection, lookback_minutes: int,
+def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = None,
                   dry_run: bool = False) -> dict:
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    started = time.monotonic()
+    lookback, why_lookback = compute_lookback(conn, lookback_minutes)
+    max_pages = pages_for(lookback)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback)
+
+    log.info("Janela: %dmin (%s) | %d paginas max", lookback, why_lookback, max_pages)
     log.info("A buscar Form 4 com compras desde %s UTC", cutoff.strftime("%Y-%m-%d %H:%M"))
 
+    stats = {"fetched": 0, "alerts": 0, "skipped": 0, "filtered": 0,
+             "lookback": lookback, "error": None}
+
+    if STATUS_MESSAGES == "always":
+        send_status(
+            f"\U0001F504 <b>Ciclo iniciado</b>\n"
+            f"Janela: {lookback}min ({esc(why_lookback)})\n"
+            f"Desde: <code>{cutoff.strftime('%Y-%m-%d %H:%M')} UTC</code>",
+            dry_run=dry_run,
+        )
+
     try:
-        raw_filings = fetch_recent_purchases(cutoff)
-    except RateLimitError:
-        log.warning("Rate limit - a desistir deste ciclo")
-        return {"fetched": 0, "alerts": 0, "skipped": 0}
+        raw_filings = fetch_recent_purchases(cutoff, max_pages=max_pages)
+    except (RateLimitError, RuntimeError) as exc:
+        log.error("Ciclo abortado: %s", exc)
+        stats["error"] = str(exc)
+        if STATUS_MESSAGES in ("always", "summary", "errors"):
+            send_status(f"❌ <b>Ciclo falhou</b>\n<code>{esc(exc)}</code>",
+                        dry_run=dry_run)
+        return stats
 
     log.info("%d filings recebidos", len(raw_filings))
-    stats = {"fetched": len(raw_filings), "alerts": 0, "skipped": 0, "filtered": 0}
+    stats["fetched"] = len(raw_filings)
 
     # Ordem cronologica ascendente: garante que o primeiro comprador de um
     # cluster e gravado antes de o segundo ser avaliado.
@@ -764,8 +888,31 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: int,
             stats["alerts"] += 1
             time.sleep(0.4)  # margem para o flood limit do Telegram
 
-    log.info("ciclo: %d filings, %d alertas, %d repetidos, %d filtrados",
-             stats["fetched"], stats["alerts"], stats["skipped"], stats["filtered"])
+    elapsed = time.monotonic() - started
+    stats["duration"] = elapsed
+
+    log.info("ciclo: %d filings, %d alertas, %d repetidos, %d filtrados em %s",
+             stats["fetched"], stats["alerts"], stats["skipped"],
+             stats["filtered"], _fmt_duration(elapsed))
+
+    # So agora se marca a corrida como bem sucedida. Se o fetch tivesse
+    # falhado, o proximo ciclo volta a cobrir esta janela.
+    set_meta(conn, LAST_RUN_KEY, _utc_now_iso())
+
+    should_report = (
+        STATUS_MESSAGES == "always"
+        or (STATUS_MESSAGES == "summary" and stats["alerts"] > 0)
+    )
+    if should_report:
+        send_status(
+            f"✅ <b>Ciclo concluido</b> em {_fmt_duration(elapsed)}\n"
+            f"\U0001F4E5 {stats['fetched']} filings analisados\n"
+            f"\U0001F514 {stats['alerts']} alerta(s) enviado(s)\n"
+            f"\U0001F501 {stats['skipped']} repetido(s)\n"
+            f"\U0001F6AB {stats['filtered']} filtrado(s)",
+            dry_run=dry_run,
+        )
+
     return stats
 
 
@@ -812,6 +959,8 @@ def log_destination() -> None:
     else:
         topic = "(NENHUM -> as mensagens vao para o topico General)"
     log.info("Destino Telegram: chat=%s | topico=%s", chat, topic)
+    log.info("Mensagens de estado: %s%s", STATUS_MESSAGES,
+             f" (topico {STATUS_TOPIC_ID})" if STATUS_TOPIC_ID else "")
     log.info("Penalizacao 10b5-1: -%d | valor minimo: $%s",
              SCORE_PENALTY_10B5, f"{MIN_TRANSACTION_VALUE_USD:,}")
 
@@ -822,8 +971,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="corre continuamente (para VPS). Default: um ciclo e sai.")
     parser.add_argument("--dry-run", action="store_true",
                         help="imprime os alertas em vez de os enviar")
-    parser.add_argument("--lookback", type=int, default=LOOKBACK_MINUTES,
-                        help=f"minutos de lookback (default {LOOKBACK_MINUTES})")
+    parser.add_argument("--lookback", type=int, default=None,
+                        help="forca a janela em minutos. Por omissao e calculada "
+                             "a partir da ultima corrida bem sucedida.")
     parser.add_argument("--db", default=DB_PATH, help="caminho da SQLite")
     args = parser.parse_args(argv)
 
@@ -834,18 +984,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.loop:
         stats = process_cycle(conn, args.lookback, dry_run=args.dry_run)
         conn.close()
-        return 0 if stats["fetched"] >= 0 else 1
+        # Sai com codigo 1 se o ciclo falhou, para o Actions marcar a corrida
+        # como falhada em vez de verde-com-erro-escondido.
+        return 1 if stats.get("error") else 0
 
     log.info("modo loop")
     cycle = 0
-    lookback = args.lookback
     while True:
         cycle += 1
         try:
             secs, slot = sleep_seconds()
             log.info("── ciclo %d │ %s ──", cycle, slot)
-            process_cycle(conn, lookback, dry_run=args.dry_run)
-            lookback = max(secs // 60 + 5, 15)
+            process_cycle(conn, args.lookback, dry_run=args.dry_run)
             time.sleep(secs)
         except KeyboardInterrupt:
             log.info("parado pelo utilizador")

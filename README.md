@@ -22,7 +22,7 @@ Alertas no Telegram sobre compras de mercado aberto (Form 4, código `P`) report
 | 10 | `while True` no Colab — morre quando a runtime desconecta | Um ciclo por invocação (`--once`), com `--loop` opcional |
 | 11 | Chaves hardcoded no ficheiro | Tudo via variáveis de ambiente |
 
-Extras: retry com backoff exponencial, tratamento do flood limit do Telegram, breakdown do score em cada alerta (`+3 CEO/CFO, +3 valor >= $500k`), filtro de `acquiredDisposedCode` para não deixar passar disposições, `--dry-run`, e 57 testes com fixtures.
+Extras: retry com backoff exponencial, tratamento do flood limit do Telegram, breakdown do score em cada alerta (`+3 CEO/CFO, +3 valor >= $500k`), filtro de `acquiredDisposedCode` para não deixar passar disposições, `--dry-run`, e 74 testes com fixtures.
 
 ---
 
@@ -84,15 +84,44 @@ O `concurrency: insider-bot` impede duas corridas simultâneas de escreverem na 
 
 ---
 
-## Cadência
+## Cadência e orçamento de minutos
 
-| Janela (ET) | Frequência | Porquê |
+| Janela (ET) | Frequência | Corridas/dia |
 |---|---|---|
-| 09:00–16:00, seg-sex | 15 min | mercado aberto |
-| 16:00–19:00, seg-sex | 10 min | pico de entrega de Form 4 |
-| resto | 1 hora | varredura de segurança |
+| 09:00–16:00, seg-sex | 30 min | 14 |
+| 16:00–19:00, seg-sex | 15 min | 12 |
+| 22:00 ET (noite) | 1x | 1 |
+| sábado 01:00 ET | 1x (catch-up de sexta) | 1 |
 
-O `LOOKBACK_MINUTES=90` cria sobreposição deliberada: uma corrida falhada ou atrasada (o cron do GitHub atrasa-se com frequência em horas de pico) não perde filings, porque o dedup por accession absorve as repetições.
+**~28 corridas/dia útil, ~590/mês.** A 1–2 minutos facturados cada, fica em 600–1200 dos 2.000 min/mês incluídos no plano Free para repos privados. Sobra espaço para mais 1–2 bots.
+
+A frequência é deliberadamente baixa. O Form 4 tem prazo de entrega de 2 dias úteis e fica público para todos ao mesmo tempo — chegar 20 minutos depois não muda nada num sinal de horizonte de meses. Correr de 10 em 10 minutos gastava a quota toda sem melhorar o sinal.
+
+### Lookback adaptativo
+
+O bot guarda na tabela `meta` a hora da última corrida **bem sucedida** e calcula a janela a partir daí, mais 25 minutos de margem:
+
+- corrida normal (30 min de intervalo) → janela de ~55 min
+- corrida falhada anteriormente → a janela seguinte cobre as duas
+- fim de semana (60h) → janela de 60h, truncada em `MAX_LOOKBACK_MINUTES` (3 dias)
+- primeira corrida → `LOOKBACK_MINUTES` (90 min)
+
+O número de páginas pedidas à SEC-API escala com a janela (`pages_for`), com teto em `MAX_PAGES_CATCHUP` para não estourar a quota da API num catch-up grande.
+
+Isto elimina a classe de bugs "perdi filings porque o cron não correu". A hora só é gravada **depois** de o ciclo correr bem — se a API falhar, a janela seguinte volta a cobrir o mesmo período.
+
+## Mensagens de estado
+
+`STATUS_MESSAGES` controla os avisos de início/fim de ciclo:
+
+| Valor | Comportamento |
+|---|---|
+| `always` | mensagem no início e no fim de cada ciclo |
+| `summary` | só no fim, e apenas se houve alertas ou erro |
+| `errors` | só quando algo falha |
+| `off` | nunca (default do código) |
+
+São sempre **silenciosas** (sem notificação no telefone) — são ~56/dia com `always`. Para as separar dos alertas, cria um tópico só para estado no grupo e define `STATUS_TOPIC_ID`.
 
 ---
 
@@ -107,8 +136,13 @@ Todas as variáveis são opcionais menos as três chaves.
 | `SCORE_MIN_TO_SEND` | `1` | abaixo disto nem envia (grava só na DB) |
 | `SCORE_SILENT_BELOW` | `3` | envia sem notificação sonora |
 | `SCORE_MAX_ALERT_FROM` | `6` | 🚨 MAX ALERT |
-| `LOOKBACK_MINUTES` | `90` | janela de busca |
+| `LOOKBACK_MINUTES` | `90` | janela de arranque a frio |
+| `LOOKBACK_BUFFER_MINUTES` | `25` | margem para atrasos do cron |
+| `MAX_LOOKBACK_MINUTES` | `4320` | teto do catch-up (3 dias) |
 | `MAX_PAGES` | `6` | páginas de 50 filings por corrida |
+| `MAX_PAGES_CATCHUP` | `30` | teto de páginas em catch-up |
+| `STATUS_MESSAGES` | `off` | `always` / `summary` / `errors` / `off` |
+| `STATUS_TOPIC_ID` | — | tópico separado para mensagens de estado |
 | `TELEGRAM_TOPIC_ID` | — | tópico de destino em supergrupos com forum |
 | `SCORE_PENALTY_10B5` | `0` | pontos a subtrair a compras de plano 10b5-1 |
 | `FINVIZ_INSIDER_URL` | `finviz.com/insidertrading?tc=7` | link do botão de últimas compras |
@@ -143,7 +177,7 @@ Cada alerta traz o breakdown para poderes auditar porque apareceu.
 
 ```bash
 pip install -r requirements.txt
-python test_bot.py                              # 57 testes, sem rede
+python test_bot.py                              # 74 testes, sem rede
 
 export SEC_API_KEY="..."
 python insider_bot.py --dry-run --lookback 240  # dados reais, imprime em vez de enviar
