@@ -800,6 +800,22 @@ def check_config(dry_run: bool) -> None:
         sys.exit(2)
 
 
+def log_destination() -> None:
+    """Diz no arranque para onde vao as mensagens. Sem isto, 'foi para o
+    canal errado' obriga a adivinhar se o problema e o secret, o workflow
+    ou o codigo."""
+    chat = TELEGRAM_CHAT_ID or "(VAZIO)"
+    if TELEGRAM_TOPIC_ID:
+        topic = TELEGRAM_TOPIC_ID
+        if not TELEGRAM_TOPIC_ID.lstrip("-").isdigit():
+            topic += "  <-- NAO E UM NUMERO, vai ser ignorado"
+    else:
+        topic = "(NENHUM -> as mensagens vao para o topico General)"
+    log.info("Destino Telegram: chat=%s | topico=%s", chat, topic)
+    log.info("Penalizacao 10b5-1: -%d | valor minimo: $%s",
+             SCORE_PENALTY_10B5, f"{MIN_TRANSACTION_VALUE_USD:,}")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="SEC Insider Trading Alert Bot")
     parser.add_argument("--loop", action="store_true",
@@ -812,6 +828,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     check_config(args.dry_run)
+    log_destination()
     conn = init_db(args.db)
 
     if not args.loop:
