@@ -154,6 +154,18 @@ check("MAX ALERT com notificacao", msg["disable_notification"] is False)
 quiet = bot.build_message(p, 1, [])
 check("score baixo fica silencioso", quiet["disable_notification"] is True)
 
+# Supergrupo com topicos (forum)
+bot.TELEGRAM_TOPIC_ID = "3"
+routed = bot.with_topic(msg)
+check("topico injectado como int", routed.get("message_thread_id") == 3)
+check("payload original intacto", "message_thread_id" not in msg)
+
+bot.TELEGRAM_TOPIC_ID = "abc"
+check("topico invalido e ignorado", "message_thread_id" not in bot.with_topic(msg))
+
+bot.TELEGRAM_TOPIC_ID = ""
+check("sem topico nao injecta nada", "message_thread_id" not in bot.with_topic(msg))
+
 
 # ── 4. Scoring e cluster ──────────────────────────────────────────
 print("\n[4] Scoring e deteccao de cluster")

@@ -67,6 +67,11 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEC_API_KEY      = os.environ.get("SEC_API_KEY", "")
 
+# Opcional: ID do topico num supergrupo com forum activado. Sem isto as
+# mensagens caem no topico "General" em vez do topico que escolheste.
+# Descobre-se no message_thread_id de uma mensagem enviada nesse topico.
+TELEGRAM_TOPIC_ID = os.environ.get("TELEGRAM_TOPIC_ID", "").strip()
+
 SEC_API_ENDPOINT = os.environ.get("SEC_API_ENDPOINT", "https://api.sec-api.io/insider-trading")
 
 DB_PATH = os.environ.get("DB_PATH", "state/alerts.db")
@@ -593,6 +598,18 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
     }
 
 
+def with_topic(payload: dict) -> dict:
+    """Encaminha para um topico especifico se TELEGRAM_TOPIC_ID estiver definido.
+    Em supergrupos com forum, sem isto tudo cai no topico General."""
+    if not TELEGRAM_TOPIC_ID:
+        return payload
+    try:
+        return {**payload, "message_thread_id": int(TELEGRAM_TOPIC_ID)}
+    except ValueError:
+        log.warning("TELEGRAM_TOPIC_ID='%s' nao e um numero - ignorado", TELEGRAM_TOPIC_ID)
+        return payload
+
+
 def send_telegram(payload: dict, dry_run: bool = False) -> bool:
     if dry_run:
         print("─" * 60)
@@ -604,6 +621,7 @@ def send_telegram(payload: dict, dry_run: bool = False) -> bool:
         log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID nao definidos")
         return False
 
+    payload = with_topic(payload)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -620,6 +638,15 @@ def send_telegram(payload: dict, dry_run: bool = False) -> bool:
                 time.sleep(retry_after + 1)
                 continue
             log.error("Telegram %s: %s", resp.status_code, resp.text[:300])
+            body = resp.text.lower()
+            if "thread not found" in body:
+                log.error("  -> TELEGRAM_TOPIC_ID=%s nao existe nesse grupo. "
+                          "Confirma o message_thread_id do topico.", TELEGRAM_TOPIC_ID)
+            elif "chat not found" in body:
+                log.error("  -> TELEGRAM_CHAT_ID=%s errado. Em supergrupos comeca "
+                          "por -100.", TELEGRAM_CHAT_ID)
+            elif "not enough rights" in body or "kicked" in body:
+                log.error("  -> O bot nao tem permissao para escrever nesse grupo/topico.")
             return False
         except Exception as exc:
             log.warning("Telegram tentativa %d falhou: %s", attempt, exc)

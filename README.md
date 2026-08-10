@@ -55,7 +55,18 @@ O repo pode ser privado — GitHub Actions funciona igual (2000 min/mês grátis
 |---|---|
 | `SEC_API_KEY` | chave da [sec-api.io](https://sec-api.io) |
 | `TELEGRAM_TOKEN` | token do @BotFather |
-| `TELEGRAM_CHAT_ID` | o teu chat id |
+| `TELEGRAM_CHAT_ID` | o teu chat id (supergrupos começam por `-100`) |
+| `TELEGRAM_TOPIC_ID` | **opcional** — só para supergrupos com tópicos |
+
+### Enviar para um tópico específico (supergrupo com forum)
+
+Se o bot está num grupo com tópicos activados, sem `TELEGRAM_TOPIC_ID` as mensagens caem no tópico *General*. Para as encaminhar:
+
+1. Adiciona o bot ao grupo (basta ser membro; admin também serve)
+2. Escreve uma mensagem qualquer **dentro do tópico** que queres usar
+3. Abre `https://api.telegram.org/bot<TOKEN>/getUpdates`
+4. Nessa mensagem, copia o `message_thread_id` → é o `TELEGRAM_TOPIC_ID`
+5. O `chat.id` do mesmo objecto é o `TELEGRAM_CHAT_ID` (negativo, começa por `-100`)
 
 ### 4. Primeira corrida
 
@@ -98,6 +109,7 @@ Todas as variáveis são opcionais menos as três chaves.
 | `SCORE_MAX_ALERT_FROM` | `6` | 🚨 MAX ALERT |
 | `LOOKBACK_MINUTES` | `90` | janela de busca |
 | `MAX_PAGES` | `6` | páginas de 50 filings por corrida |
+| `TELEGRAM_TOPIC_ID` | — | tópico de destino em supergrupos com forum |
 | `VERBOSE` | `false` | logging DEBUG |
 
 ## Scoring
