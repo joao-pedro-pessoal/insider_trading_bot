@@ -1,0 +1,112 @@
+name: Insider Alert Bot
+
+on:
+  schedule:
+    # Horas em UTC. Nova Iorque = UTC-4 (verao) / UTC-5 (inverno).
+    # Cobertura desenhada para verao (EDT); no inverno desloca-se 1h — o
+    # lookback de 90min absorve isso sem perder filings.
+
+    # Pre-abertura + mercado aberto: 13:00-20:00 UTC (09:00-16:00 ET), a cada 15min
+    - cron: "*/15 13-20 * * 1-5"
+    # Pos-fecho, pico de entrega de Form 4: 20:00-23:00 UTC (16:00-19:00 ET), a cada 10min
+    - cron: "*/10 20-22 * * 1-5"
+    # Varredura de seguranca fora de horas, 1x/hora
+    - cron: "17 0-12,23 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      lookback:
+        description: "Minutos de lookback"
+        required: false
+        default: "180"
+      dry_run:
+        description: "true = nao envia para o Telegram"
+        required: false
+        default: "false"
+
+# Impede duas corridas simultaneas a escreverem na mesma DB
+concurrency:
+  group: insider-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # necessario para gravar o estado da SQLite
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout do branch de estado
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      # A SQLite vive num branch orfao 'bot-state' para nao poluir o historico
+      # do codigo com diffs binarios.
+      - name: Restaurar estado
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+            git fetch origin bot-state --depth=1
+            git show origin/bot-state:alerts.db > state/alerts.db 2>/dev/null || true
+            echo "Estado restaurado ($(stat -c%s state/alerts.db 2>/dev/null || echo 0) bytes)"
+          else
+            echo "Sem branch bot-state — arranque a frio"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Correr o bot
+        env:
+          SEC_API_KEY:      ${{ secrets.SEC_API_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_TRANSACTION_VALUE_USD: "25000"
+          CLUSTER_WINDOW_DAYS: "7"
+          SCORE_MIN_TO_SEND: "1"
+          LOOKBACK_MINUTES: ${{ github.event.inputs.lookback || '90' }}
+        run: |
+          ARGS="--db state/alerts.db"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python insider_bot.py $ARGS
+
+      - name: Guardar estado
+        if: always()
+        run: |
+          if [ ! -f state/alerts.db ]; then
+            echo "Sem DB para guardar"; exit 0
+          fi
+          git config user.name  "insider-bot"
+          git config user.email "insider-bot@users.noreply.github.com"
+
+          TMP=$(mktemp -d)
+          cp state/alerts.db "$TMP/alerts.db"
+
+          git checkout --orphan bot-state-tmp
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          find . -maxdepth 1 ! -name . ! -name .git ! -name state -exec rm -rf {} +
+          cp "$TMP/alerts.db" alerts.db
+
+          git add -f alerts.db
+          git commit -m "estado: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 0
+          git push --force origin HEAD:bot-state
+
+      - name: Guardar DB como artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alerts-db-${{ github.run_id }}
+          path: state/alerts.db
+          retention-days: 14
+          if-no-files-found: ignore
