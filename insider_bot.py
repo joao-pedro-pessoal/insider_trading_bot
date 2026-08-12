@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """
-SEC INSIDER TRADING ALERT BOT v1.1
+SEC INSIDER TRADING ALERT BOT v1.2
 ==================================
 
-Alerta no Telegram sobre compras de mercado aberto (Form 4, codigo P) reportadas
-por insiders na SEC.
+Telegram alerts for open-market insider purchases (SEC Form 4, code P).
 
-Mudancas face a v1.0:
-  * Corre UM ciclo por invocacao (--once, default) para cron / GitHub Actions.
-    O modo --loop continua disponivel para VPS.
-  * Field paths da SEC-API corrigidos (issuer.*, coding.code, amounts.*).
-  * Query enviada como string Lucene (a API nao aceita query_string aninhado).
-  * Filtragem temporal feita localmente com datetimes timezone-aware, com
-    paginacao -- acaba a classe de bugs de UTC vs horario de Nova Iorque.
-  * Escaping HTML correcto (& < > deixam de quebrar mensagens).
-  * URL do filing construido a partir do accession number (o antigo usava o
-    ticker como CIK e nunca funcionava).
-  * Agrega TODAS as transacoes P do mesmo filing (antes lia so a primeira).
-  * 10b5-1 detectado via campo oficial aff10b5One, nao por string matching.
-  * Cluster conta insiders DISTINTOS e le de todas as transacoes vistas, nao
-    so das que geraram alerta.
-  * Segredos vem do ambiente. Nada hardcoded.
+Designed to run one cycle per invocation on a cron (GitHub Actions), with an
+optional --loop mode for a long-running VPS process.
 
-NAO e conselho financeiro. Ver README.md.
+Key design decisions worth knowing before you change anything:
+
+  * Time filtering happens locally, not in the API query. The API returns
+    filedAt in New York time with an explicit offset; comparing that against
+    a UTC-derived cutoff string was the single worst bug in v1.0. We paginate
+    by filedAt descending and stop at the cutoff, comparing timezone-aware
+    datetimes in Python -- the only place that comparison is reliable.
+
+  * The lookback window is derived from the last successful run, stored in the
+    database. A fixed window loses filings whenever a run fails, is delayed,
+    or when there is a long gap between crons (Friday night to Monday).
+
+  * Every parsed filing is recorded, not just the ones that trigger an alert.
+    Cluster detection reads from that table, so filtering before writing would
+    blind it.
+
+  * Deduplication is by accession number, which makes generous overlap between
+    runs harmless. Overlap is deliberate.
+
+NOT financial advice. The scoring weights are heuristics and have never been
+backtested. See README.md.
 """
 
 from __future__ import annotations
@@ -50,7 +56,7 @@ NY_TZ = ZoneInfo("America/New_York")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CONFIG  (tudo via variaveis de ambiente)
+#  CONFIGURATION  (all via environment variables)
 # ══════════════════════════════════════════════════════════════════
 
 def _env_int(name: str, default: int) -> int:
@@ -68,19 +74,19 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEC_API_KEY      = os.environ.get("SEC_API_KEY", "")
 
-# Opcional: ID do topico num supergrupo com forum activado. Sem isto as
-# mensagens caem no topico "General" em vez do topico que escolheste.
-# Descobre-se no message_thread_id de uma mensagem enviada nesse topico.
+# Optional: topic ID inside a forum-enabled supergroup. Without it, messages
+# land in the "General" topic instead of the one you picked. Find it in the
+# message_thread_id of any message posted in that topic.
 TELEGRAM_TOPIC_ID = os.environ.get("TELEGRAM_TOPIC_ID", "").strip()
 
-# Mensagens de estado (inicio/fim de ciclo):
-#   "always"  - sempre, mesmo em ciclos sem alertas
-#   "summary" - so a de fim, e apenas se houve alertas ou erro
-#   "errors"  - so quando algo falha
-#   "off"     - nunca
+# Cycle start/finish status messages:
+#   "always"  - every cycle, even quiet ones
+#   "summary" - finish only, and only when there were alerts or an error
+#   "errors"  - only when something fails
+#   "off"     - never
 STATUS_MESSAGES = os.environ.get("STATUS_MESSAGES", "off").strip().lower()
 
-# Topico separado para as mensagens de estado. Vazio = mesmo topico dos alertas.
+# Separate topic for status messages. Empty = same topic as the alerts.
 STATUS_TOPIC_ID = os.environ.get("STATUS_TOPIC_ID", "").strip()
 
 SEC_API_ENDPOINT = os.environ.get("SEC_API_ENDPOINT", "https://api.sec-api.io/insider-trading")
@@ -89,33 +95,32 @@ DB_PATH = os.environ.get("DB_PATH", "state/alerts.db")
 
 MIN_TRANSACTION_VALUE_USD = _env_int("MIN_TRANSACTION_VALUE_USD", 25_000)
 CLUSTER_WINDOW_DAYS       = _env_int("CLUSTER_WINDOW_DAYS", 7)
-SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 1)   # abaixo disto nem envia
-SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 3)  # envia sem notificacao
+SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 1)   # below this, log only
+SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 3)  # send without notification
 SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 6)
 
-# Penalizacao para compras feitas ao abrigo de um plano 10b5-1: foram agendadas
-# com meses de antecedencia, logo dizem muito menos sobre a visao actual do
-# insider. Default 0 (sem penalizacao) para nao mudar o comportamento sem
-# escolha tua -- por 2 ou 3 se quiseres que planos automaticos desçam no ranking.
+# Penalty for purchases made under a 10b5-1 plan: they were scheduled months in
+# advance, so they say far less about the insider's current view. Default 0 (no
+# penalty) so behaviour does not change without you choosing it -- set to 2 or 3
+# to push automatic plans down the ranking.
 SCORE_PENALTY_10B5        = _env_int("SCORE_PENALTY_10B5", 0)
 
-# Lookback de arranque a frio (sem estado anterior na DB). Em corridas normais
-# a janela e calculada a partir da ultima corrida bem sucedida.
+# Cold-start lookback, used only when there is no previous run in the database.
 LOOKBACK_MINUTES        = _env_int("LOOKBACK_MINUTES", 90)
-# Margem somada ao intervalo desde a ultima corrida, para absorver os atrasos
-# do cron do GitHub (tipicamente 5-20 min).
+# Margin added to the gap since the last run, to absorb GitHub cron delays
+# (typically 5-20 minutes).
 LOOKBACK_BUFFER_MINUTES = _env_int("LOOKBACK_BUFFER_MINUTES", 25)
-# Teto do catch-up. 3 dias cobre um fim de semana inteiro mais folga; mais do
-# que isso significa que o bot esteve dias parado e nao vale a pena inundar.
+# Catch-up ceiling. Three days covers a full weekend with room to spare; beyond
+# that the bot has been down for days and flooding the channel helps nobody.
 MAX_LOOKBACK_MINUTES    = _env_int("MAX_LOOKBACK_MINUTES", 4320)
 
-PAGE_SIZE         = 50        # maximo da SEC-API
+PAGE_SIZE         = 50        # SEC-API maximum
 MAX_PAGES         = _env_int("MAX_PAGES", 6)
-# Teto de paginas em modo catch-up. Cada pagina e 1 pedido a SEC-API, por isso
-# isto e tambem o travao de consumo do teu plano.
+# Page ceiling in catch-up mode. Each page is one SEC-API request, so this is
+# also the brake on your API plan consumption.
 MAX_PAGES_CATCHUP = _env_int("MAX_PAGES_CATCHUP", 30)
-HTTP_TIMEOUT   = 25
-MAX_RETRIES    = 3
+HTTP_TIMEOUT      = 25
+MAX_RETRIES       = 3
 
 logging.basicConfig(
     level=logging.DEBUG if _env_bool("VERBOSE") else logging.INFO,
@@ -126,11 +131,11 @@ log = logging.getLogger("InsiderBot")
 
 
 class RateLimitError(Exception):
-    """SEC-API devolveu 429."""
+    """SEC-API returned 429."""
 
 
 # ══════════════════════════════════════════════════════════════════
-#  BASE DE DADOS
+#  DATABASE
 # ══════════════════════════════════════════════════════════════════
 
 SCHEMA = """
@@ -142,8 +147,8 @@ CREATE TABLE IF NOT EXISTS sent_alerts (
     sent_at          TEXT NOT NULL
 );
 
--- Log de TUDO o que foi parseado, mesmo o que nao gerou alerta.
--- E daqui que sai a deteccao de cluster: filtrar antes de gravar cegava-a.
+-- Log of EVERYTHING parsed, including filings that never triggered an alert.
+-- Cluster detection reads from here: filtering before writing would blind it.
 CREATE TABLE IF NOT EXISTS transactions (
     accession_number TEXT PRIMARY KEY,
     ticker           TEXT NOT NULL,
@@ -164,8 +169,8 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_txn_ticker_date
     ON transactions (ticker, trade_date);
 
--- Estado do proprio bot. Guarda a hora da ultima corrida bem sucedida para
--- o lookback poder ser calculado em vez de fixo.
+-- The bot's own state. Holds the last successful run so the lookback window
+-- can be computed instead of hardcoded.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -182,7 +187,7 @@ def init_db(path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
     conn.commit()
-    log.info("DB pronta: %s", path)
+    log.info("Database ready: %s", path)
     return conn
 
 
@@ -244,51 +249,52 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def compute_lookback(conn: sqlite3.Connection,
                      override: Optional[int] = None) -> tuple[int, str]:
     """
-    Lookback adaptativo: cobre desde a ultima corrida bem sucedida, com margem.
+    Adaptive lookback: cover everything since the last successful run, plus a
+    margin.
 
-    Um lookback fixo perde filings sempre que uma corrida falha, atrasa, ou
-    quando ha um intervalo grande entre crons (sexta a noite -> segunda).
-    Calcular a partir da ultima corrida fecha essa classe de furos toda.
+    A fixed window loses filings whenever a run fails, is delayed, or when the
+    gap between crons is large (Friday night through Monday). Deriving it from
+    the last successful run closes that whole class of gaps.
     """
     if override is not None:
-        return override, "forcado por --lookback"
+        return override, "forced via --lookback"
 
     last = get_meta(conn, LAST_RUN_KEY)
     if not last:
-        return LOOKBACK_MINUTES, "primeira corrida (sem estado anterior)"
+        return LOOKBACK_MINUTES, "first run (no previous state)"
 
     try:
         last_dt = datetime.fromisoformat(last)
     except ValueError:
-        return LOOKBACK_MINUTES, f"estado ilegivel ({last!r})"
+        return LOOKBACK_MINUTES, f"unreadable state ({last!r})"
 
     if last_dt.tzinfo is None:
         last_dt = last_dt.replace(tzinfo=timezone.utc)
 
     gap = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
     if gap < 0:
-        return LOOKBACK_MINUTES, "relogio inconsistente"
+        return LOOKBACK_MINUTES, "clock inconsistency (last run in the future)"
 
     minutes = int(gap) + LOOKBACK_BUFFER_MINUTES
     if minutes > MAX_LOOKBACK_MINUTES:
         return (MAX_LOOKBACK_MINUTES,
-                f"intervalo de {gap / 60:.1f}h truncado ao maximo")
-    return max(minutes, 15), f"desde a ultima corrida ({gap:.0f}min atras)"
+                f"{gap / 60:.1f}h gap truncated to ceiling")
+    return max(minutes, 15), f"since last run ({gap:.0f}min ago)"
 
 
 def pages_for(lookback_minutes: int) -> int:
-    """Paginas a buscar. Uma janela maior precisa de mais paginas, senao o
-    catch-up trunca silenciosamente e volta a perder filings."""
+    """Pages to fetch. A wider window needs more pages, otherwise catch-up
+    truncates silently and we are back to losing filings."""
     needed = max(MAX_PAGES, int(lookback_minutes / 30))
     return min(needed, MAX_PAGES_CATCHUP)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  INGESTAO
+#  INGESTION
 # ══════════════════════════════════════════════════════════════════
 
-# Lucene: Form 4 com pelo menos uma compra de mercado aberto (codigo P).
-# O filtro temporal e feito localmente -- ver docstring do modulo.
+# Lucene: Form 4 filings containing at least one open-market purchase (code P).
+# Time filtering is done locally -- see the module docstring.
 BASE_QUERY = 'documentType:"4" AND nonDerivativeTable.transactions.coding.code:P'
 
 
@@ -308,31 +314,30 @@ def _post_with_retry(payload: dict) -> dict:
             if resp.status_code == 429:
                 raise RateLimitError("SEC-API rate limit (429)")
             if resp.status_code in (401, 403):
-                raise RuntimeError(f"SEC-API auth falhou ({resp.status_code}) - verifica SEC_API_KEY")
+                raise RuntimeError(f"SEC-API auth failed ({resp.status_code}) - check SEC_API_KEY")
             resp.raise_for_status()
             return resp.json()
         except (RateLimitError, RuntimeError):
             raise
-        except Exception as exc:  # rede, timeout, 5xx
+        except Exception as exc:  # network, timeout, 5xx
             last_error = exc
             wait = 2 ** attempt
-            log.warning("SEC-API tentativa %d/%d falhou (%s) - retry em %ds",
+            log.warning("SEC-API attempt %d/%d failed (%s) - retrying in %ds",
                         attempt, MAX_RETRIES, exc, wait)
             time.sleep(wait)
-    raise RuntimeError(f"SEC-API indisponivel apos {MAX_RETRIES} tentativas: {last_error}")
+    raise RuntimeError(f"SEC-API unreachable after {MAX_RETRIES} attempts: {last_error}")
 
 
 def fetch_recent_purchases(cutoff: datetime, max_pages: int = MAX_PAGES) -> list[dict]:
     """
-    Devolve filings Form 4 com compras, com filedAt >= cutoff.
+    Return Form 4 filings containing purchases with filedAt >= cutoff.
 
-    Pagina por filedAt descendente e para assim que encontra um filing mais
-    antigo que o cutoff. Sem aritmetica de fusos horarios na query -- a
-    comparacao e feita com datetimes aware em Python, que e o unico sitio
-    onde isso e fiavel.
+    Paginates by filedAt descending and stops as soon as it hits a filing older
+    than the cutoff. No timezone arithmetic in the query -- the comparison uses
+    timezone-aware datetimes in Python, which is the only place it is reliable.
     """
     if cutoff.tzinfo is None:
-        raise ValueError("cutoff tem de ser timezone-aware")
+        raise ValueError("cutoff must be timezone-aware")
 
     collected: list[dict] = []
     for page in range(max_pages):
@@ -351,25 +356,25 @@ def fetch_recent_purchases(cutoff: datetime, max_pages: int = MAX_PAGES) -> list
         for filing in batch:
             filed_at = _parse_dt(filing.get("filedAt"))
             if filed_at is None:
-                collected.append(filing)  # sem data: deixa passar, dedup protege
+                collected.append(filing)  # no date: let it through, dedup protects us
                 continue
             if filed_at < cutoff:
                 stop = True
                 break
             collected.append(filing)
 
-        log.debug("pagina %d: %d filings, %d acumulados", page, len(batch), len(collected))
+        log.debug("page %d: %d filings, %d collected", page, len(batch), len(collected))
         if stop or len(batch) < PAGE_SIZE:
             break
     else:
-        log.warning("MAX_PAGES (%d) atingido - podem faltar filings. "
-                    "Reduz LOOKBACK_MINUTES ou aumenta MAX_PAGES.", max_pages)
+        log.warning("Hit the page ceiling (%d) - filings may be missing. "
+                    "Raise MAX_PAGES_CATCHUP or shorten the window.", max_pages)
 
     return collected
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    """Parse ISO 8601 da SEC-API ('2022-08-09T21:23:00-04:00') -> aware datetime."""
+    """Parse SEC-API ISO 8601 ('2022-08-09T21:23:00-04:00') into an aware datetime."""
     if not value or not isinstance(value, str):
         return None
     try:
@@ -377,7 +382,7 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY_TZ)  # SEC reporta em horario de NY
+        dt = dt.replace(tzinfo=NY_TZ)  # the SEC reports in New York time
     return dt
 
 
@@ -387,16 +392,16 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 
 def parse_filing(raw: dict) -> Optional[dict]:
     """
-    Normaliza um filing da SEC-API numa transacao agregada.
+    Normalise a SEC-API filing into a single aggregated transaction.
 
-    Agrega TODAS as linhas com codigo P + acquiredDisposedCode A do mesmo
-    filing: um insider que compra em 3 tranches aparecia subvalorizado quando
-    se lia apenas a primeira linha.
+    Aggregates EVERY row coded P with acquiredDisposedCode A from the same
+    filing: an insider buying in three tranches was being undervalued when only
+    the first row was read.
     """
     try:
         return _parse(raw)
     except Exception as exc:
-        log.debug("parse falhou (%s): %s", exc, str(raw)[:160])
+        log.debug("parse failed (%s): %s", exc, str(raw)[:160])
         return None
 
 
@@ -411,7 +416,7 @@ def _parse(raw: dict) -> Optional[dict]:
     cik     = str(issuer.get("cik") or "").strip()
 
     owner        = raw.get("reportingOwner") or {}
-    insider_name = owner.get("name") or "Desconhecido"
+    insider_name = owner.get("name") or "Unknown"
     insider_cik  = str(owner.get("cik") or "").strip()
     title        = _extract_title(owner.get("relationship") or {})
 
@@ -448,8 +453,8 @@ def _parse(raw: dict) -> Optional[dict]:
 
     avg_price = total_cost / total_shares
 
-    # Campo oficial das alteracoes de 2023 a Rule 10b5-1. Muito mais fiavel
-    # do que procurar "10b5-1" no texto das footnotes.
+    # Official field from the SEC's 2023 amendments to Rule 10b5-1. Far more
+    # reliable than string-matching "10b5-1" in the footnote text.
     is_10b5 = bool(raw.get("aff10b5One")) or _footnotes_mention_10b5(raw)
 
     return {
@@ -483,7 +488,7 @@ def _footnotes_mention_10b5(raw: dict) -> bool:
 
 
 def _filing_url(issuer_cik: str, accession: str) -> str:
-    """URL real do filing no EDGAR. A v1.0 usava o ticker como CIK -> 404."""
+    """Real EDGAR filing URL. v1.0 used the ticker as the CIK, so every link 404'd."""
     if not issuer_cik or not accession:
         return "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=4"
     plain = accession.replace("-", "")
@@ -514,18 +519,18 @@ def _safe_float(val: Any) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  FILTROS
+#  FILTERS
 # ══════════════════════════════════════════════════════════════════
 
 def passes_filters(txn: dict) -> tuple[bool, str]:
     if not txn.get("ticker"):
-        return False, "sem ticker (provavelmente nao cotada)"
+        return False, "no ticker (likely not publicly traded)"
     if txn["price"] <= 0:
-        return False, "preco zero (grant disfarcado de compra)"
+        return False, "zero price (a grant dressed up as a purchase)"
     if txn["quantity"] <= 0:
-        return False, "quantidade zero"
+        return False, "zero quantity"
     if txn["total_value"] < MIN_TRANSACTION_VALUE_USD:
-        return False, f"valor ${txn['total_value']:,.0f} < minimo"
+        return False, f"value ${txn['total_value']:,.0f} below minimum"
     return True, "ok"
 
 
@@ -535,12 +540,12 @@ def passes_filters(txn: dict) -> tuple[bool, str]:
 
 def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]]:
     """
-    Score ponderado. Devolve (score, breakdown) -- o breakdown existe para
-    poderes auditar porque e que um alerta apareceu, e para a Fase 3 poder
-    testar cada componente isoladamente.
+    Weighted score. Returns (score, breakdown). The breakdown exists so you can
+    audit why an alert fired, and so Phase 3 can test each component in
+    isolation.
 
-    Nota honesta: estes pesos sao heuristicas, nao resultado de backtest.
-    Nao trates o score como probabilidade de nada.
+    Honest note: these weights are heuristics, not backtest output. Do not read
+    the score as a probability of anything.
     """
     score = 0
     why: list[str] = []
@@ -556,10 +561,10 @@ def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]
     value = txn["total_value"]
     if value >= 500_000:
         score += 3
-        why.append("+3 valor >= $500k")
+        why.append("+3 value >= $500k")
     elif value >= 100_000:
         score += 1
-        why.append("+1 valor >= $100k")
+        why.append("+1 value >= $100k")
 
     post = txn.get("post_qty", 0)
     qty  = txn["quantity"]
@@ -569,9 +574,10 @@ def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]
         txn["pct_increase"] = round(pct, 1)
         if pct >= 20:
             score += 2
-            why.append(f"+2 posicao +{pct:.0f}%")
+            why.append(f"+2 position +{pct:.0f}%")
     else:
-        # post_qty <= qty: primeira compra, ou o filing nao reportou o total.
+        # post_qty <= qty: either a first purchase, or the filing did not report
+        # a reliable post-transaction total.
         txn["pct_increase"] = None
 
     cluster = count_cluster_insiders(conn, txn)
@@ -582,19 +588,19 @@ def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]
 
     if txn.get("is_10b5") and SCORE_PENALTY_10B5:
         score -= SCORE_PENALTY_10B5
-        why.append(f"-{SCORE_PENALTY_10B5} plano 10b5-1")
+        why.append(f"-{SCORE_PENALTY_10B5} 10b5-1 plan")
 
     return max(score, 0), why
 
 
 def count_cluster_insiders(conn: sqlite3.Connection, txn: dict) -> int:
     """
-    Numero de insiders DISTINTOS (excluindo este) que compraram o mesmo ticker
-    na janela de cluster.
+    Number of DISTINCT insiders (excluding this one) who bought the same ticker
+    inside the cluster window.
 
-    Correcoes face a v1.0: compara datas com datas (nao data vs timestamp ISO),
-    conta pessoas distintas em vez de filings, e le de todas as transacoes
-    registadas em vez de so das que geraram alerta.
+    Fixes versus v1.0: compares dates against dates rather than a date against
+    an ISO timestamp, counts people instead of filings, and reads from every
+    recorded transaction instead of only the ones that alerted.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=CLUSTER_WINDOW_DAYS)).date().isoformat()
     cur = conn.execute(
@@ -619,12 +625,12 @@ def count_cluster_insiders(conn: sqlite3.Connection, txn: dict) -> int:
 # ══════════════════════════════════════════════════════════════════
 
 def esc(value: Any) -> str:
-    """Escapa & < > para parse_mode=HTML. A v1.0 tinha um escaper de
-    MarkdownV2 que nunca era chamado -- qualquer 'Procter & Gamble' dava 400."""
+    """Escape & < > for parse_mode=HTML. v1.0 had a MarkdownV2 escaper that was
+    never called, so any 'Procter & Gamble' produced a 400 and a lost alert."""
     return html.escape(str(value), quote=False)
 
 
-# Feed global das ultimas compras de insiders no Finviz (tc=7 = latest buys).
+# Global feed of the latest insider buys on Finviz (tc=7 = latest buys).
 FINVIZ_LATEST_BUYS = os.environ.get(
     "FINVIZ_INSIDER_URL", "https://finviz.com/insidertrading?tc=7"
 )
@@ -632,13 +638,13 @@ FINVIZ_LATEST_BUYS = os.environ.get(
 
 def build_buttons(txn: dict) -> list[list[dict]]:
     """
-    Teclado inline, 3 linhas:
-      1. TradingView (grafico)     | Filing SEC (fonte primaria)
-      2. Investing.com (noticias)  | Finviz (fundamentais + historico insider)
-      3. Ultimas compras de insiders no mercado (link global)
+    Inline keyboard, three rows:
+      1. TradingView (chart)      | SEC filing (primary source)
+      2. Investing.com (news)     | Finviz (fundamentals + insider history)
+      3. Latest insider buys market-wide (global link)
 
-    Os tickers vao URL-encoded: ha tickers com pontos (BRK.B) e hifens
-    (BF-B) que quebrariam a query string.
+    Tickers are URL-encoded: symbols with dots (BRK.B) or hyphens (BF-B) would
+    otherwise break the query string.
     """
     ticker = txn["ticker"]
     t = quote(ticker, safe="")
@@ -647,7 +653,7 @@ def build_buttons(txn: dict) -> list[list[dict]]:
         [
             {"text": f"\U0001F4C8 {ticker} TradingView",
              "url": f"https://www.tradingview.com/symbols/{t}/"},
-            {"text": "\U0001F4C4 Filing SEC", "url": txn["sec_url"]},
+            {"text": "\U0001F4C4 SEC filing", "url": txn["sec_url"]},
         ],
         [
             {"text": "\U0001F4F0 Investing.com",
@@ -656,7 +662,7 @@ def build_buttons(txn: dict) -> list[list[dict]]:
              "url": f"https://finviz.com/quote.ashx?t={t}"},
         ],
         [
-            {"text": "\U0001F440 Ultimas compras de insiders",
+            {"text": "\U0001F440 Latest insider buys",
              "url": FINVIZ_LATEST_BUYS},
         ],
     ]
@@ -668,13 +674,13 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
     if score >= SCORE_MAX_ALERT_FROM:
         emoji, label, silent = "\U0001F6A8", "MAX ALERT", False
     elif score >= SCORE_SILENT_BELOW:
-        emoji, label, silent = "\U0001F534", "SINAL FORTE", False
+        emoji, label, silent = "\U0001F534", "STRONG SIGNAL", False
     else:
-        emoji, label, silent = "\U0001F7E1", "SINAL FRACO", True
+        emoji, label, silent = "\U0001F7E1", "WEAK SIGNAL", True
 
-    trade_type = ("⚠️ <b>Plano automatico (10b5-1)</b>"
+    trade_type = ("⚠️ <b>Automatic plan (10b5-1)</b>"
                   if txn.get("is_10b5")
-                  else "✅ <b>Compra discricionaria</b>")
+                  else "✅ <b>Discretionary purchase</b>")
 
     lines = [
         f"{emoji} <b>{label}</b>  |  Score: <b>{score}</b>",
@@ -683,31 +689,31 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
         f"\U0001F464 <b>{esc(txn.get('insider_name'))}</b>",
         f"\U0001F4BC {esc(txn.get('title'))}",
         "",
-        f"\U0001F4B5 Valor total: <code>${txn['total_value']:,.0f}</code>",
-        f"\U0001F4C8 Preco medio: <code>${txn['price']:,.2f}</code>",
-        f"\U0001F4E6 Acoes: <code>{txn['quantity']:,}</code>",
+        f"\U0001F4B5 Total value: <code>${txn['total_value']:,.0f}</code>",
+        f"\U0001F4C8 Avg price:   <code>${txn['price']:,.2f}</code>",
+        f"\U0001F4E6 Shares:      <code>{txn['quantity']:,}</code>",
     ]
 
     if txn.get("pct_increase") is not None:
-        lines.append(f"\U0001F4CA Posicao: <code>+{txn['pct_increase']:.1f}%</code>")
+        lines.append(f"\U0001F4CA Position:    <code>+{txn['pct_increase']:.1f}%</code>")
     if txn.get("n_transactions", 1) > 1:
-        lines.append(f"\U0001F9FE Agregado de {txn['n_transactions']} transacoes")
+        lines.append(f"\U0001F9FE Aggregated from {txn['n_transactions']} transactions")
 
     lines += ["", trade_type]
 
     if txn.get("cluster", 0) > 0:
         lines.append(
-            f"\U0001F501 <b>CLUSTER</b> — {txn['cluster']} outro(s) insider(s) "
-            f"compraram nos ultimos {CLUSTER_WINDOW_DAYS}d"
+            f"\U0001F501 <b>CLUSTER BUY</b> — {txn['cluster']} other insider(s) "
+            f"bought in the last {CLUSTER_WINDOW_DAYS}d"
         )
 
     lines += [
         "",
-        f"\U0001F4C5 Transacao: <code>{esc(txn.get('trade_date'))}</code>",
-        f"\U0001F551 Reportado: <i>{esc(str(txn.get('filing_date'))[:16].replace('T', ' '))}</i>",
-        f"\U0001F9EE Score: <i>{esc(', '.join(why) if why else 'nenhum criterio')}</i>",
+        f"\U0001F4C5 Trade date: <code>{esc(txn.get('trade_date'))}</code>",
+        f"\U0001F551 Filed:      <i>{esc(str(txn.get('filing_date'))[:16].replace('T', ' '))}</i>",
+        f"\U0001F9EE Score:      <i>{esc(', '.join(why) if why else 'no criteria met')}</i>",
         "",
-        "<i>Nao e conselho financeiro. Sinal nao testado historicamente.</i>",
+        "<i>Not financial advice. This signal has not been backtested.</i>",
     ]
 
     keyboard = {"inline_keyboard": build_buttons(txn)}
@@ -723,15 +729,15 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
 
 
 def with_topic(payload: dict) -> dict:
-    """Encaminha para um topico especifico se TELEGRAM_TOPIC_ID estiver definido.
-    Em supergrupos com forum, sem isto tudo cai no topico General.
-    Um message_thread_id ja presente no payload tem prioridade."""
+    """Route to a specific topic when TELEGRAM_TOPIC_ID is set. In forum
+    supergroups, without this everything lands in General. A message_thread_id
+    already present in the payload takes precedence."""
     if "message_thread_id" in payload or not TELEGRAM_TOPIC_ID:
         return payload
     try:
         return {**payload, "message_thread_id": int(TELEGRAM_TOPIC_ID)}
     except ValueError:
-        log.warning("TELEGRAM_TOPIC_ID='%s' nao e um numero - ignorado", TELEGRAM_TOPIC_ID)
+        log.warning("TELEGRAM_TOPIC_ID='%s' is not a number - ignored", TELEGRAM_TOPIC_ID)
         return payload
 
 
@@ -743,7 +749,7 @@ def send_telegram(payload: dict, dry_run: bool = False) -> bool:
         return True
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID nao definidos")
+        log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set")
         return False
 
     payload = with_topic(payload)
@@ -759,22 +765,22 @@ def send_telegram(payload: dict, dry_run: bool = False) -> bool:
                     retry_after = int(resp.json()["parameters"]["retry_after"])
                 except Exception:
                     pass
-                log.warning("Telegram flood limit - espera %ds", retry_after)
+                log.warning("Telegram flood limit - waiting %ds", retry_after)
                 time.sleep(retry_after + 1)
                 continue
             log.error("Telegram %s: %s", resp.status_code, resp.text[:300])
             body = resp.text.lower()
             if "thread not found" in body:
-                log.error("  -> TELEGRAM_TOPIC_ID=%s nao existe nesse grupo. "
-                          "Confirma o message_thread_id do topico.", TELEGRAM_TOPIC_ID)
+                log.error("  -> TELEGRAM_TOPIC_ID=%s does not exist in that group. "
+                          "Check the topic's message_thread_id.", TELEGRAM_TOPIC_ID)
             elif "chat not found" in body:
-                log.error("  -> TELEGRAM_CHAT_ID=%s errado. Em supergrupos comeca "
-                          "por -100.", TELEGRAM_CHAT_ID)
+                log.error("  -> TELEGRAM_CHAT_ID=%s is wrong. Supergroup IDs start "
+                          "with -100.", TELEGRAM_CHAT_ID)
             elif "not enough rights" in body or "kicked" in body:
-                log.error("  -> O bot nao tem permissao para escrever nesse grupo/topico.")
+                log.error("  -> The bot lacks permission to post in that group/topic.")
             return False
         except Exception as exc:
-            log.warning("Telegram tentativa %d falhou: %s", attempt, exc)
+            log.warning("Telegram attempt %d failed: %s", attempt, exc)
             time.sleep(2 ** attempt)
     return False
 
@@ -789,8 +795,8 @@ def send_plain(text: str, dry_run: bool = False) -> None:
 
 
 def send_status(text: str, dry_run: bool = False) -> None:
-    """Mensagem de estado. Sempre silenciosa (sao ~2 por corrida; com
-    notificacao seria insuportavel) e opcionalmente num topico separado."""
+    """Status message. Always silent (there are ~2 per run; with notifications
+    this would be unbearable) and optionally in a separate topic."""
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -802,7 +808,7 @@ def send_status(text: str, dry_run: bool = False) -> None:
         try:
             payload["message_thread_id"] = int(STATUS_TOPIC_ID)
         except ValueError:
-            log.warning("STATUS_TOPIC_ID='%s' nao e um numero - ignorado", STATUS_TOPIC_ID)
+            log.warning("STATUS_TOPIC_ID='%s' is not a number - ignored", STATUS_TOPIC_ID)
     send_telegram(payload, dry_run=dry_run)
 
 
@@ -811,7 +817,7 @@ def _fmt_duration(seconds: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CICLO
+#  CYCLE
 # ══════════════════════════════════════════════════════════════════
 
 def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = None,
@@ -821,35 +827,35 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
     max_pages = pages_for(lookback)
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback)
 
-    log.info("Janela: %dmin (%s) | %d paginas max", lookback, why_lookback, max_pages)
-    log.info("A buscar Form 4 com compras desde %s UTC", cutoff.strftime("%Y-%m-%d %H:%M"))
+    log.info("Window: %dmin (%s) | %d pages max", lookback, why_lookback, max_pages)
+    log.info("Fetching Form 4 purchases filed since %s UTC", cutoff.strftime("%Y-%m-%d %H:%M"))
 
     stats = {"fetched": 0, "alerts": 0, "skipped": 0, "filtered": 0,
              "lookback": lookback, "error": None}
 
     if STATUS_MESSAGES == "always":
         send_status(
-            f"\U0001F504 <b>Ciclo iniciado</b>\n"
-            f"Janela: {lookback}min ({esc(why_lookback)})\n"
-            f"Desde: <code>{cutoff.strftime('%Y-%m-%d %H:%M')} UTC</code>",
+            f"\U0001F504 <b>Cycle started</b>\n"
+            f"Window: {lookback}min ({esc(why_lookback)})\n"
+            f"Since: <code>{cutoff.strftime('%Y-%m-%d %H:%M')} UTC</code>",
             dry_run=dry_run,
         )
 
     try:
         raw_filings = fetch_recent_purchases(cutoff, max_pages=max_pages)
     except (RateLimitError, RuntimeError) as exc:
-        log.error("Ciclo abortado: %s", exc)
+        log.error("Cycle aborted: %s", exc)
         stats["error"] = str(exc)
         if STATUS_MESSAGES in ("always", "summary", "errors"):
-            send_status(f"❌ <b>Ciclo falhou</b>\n<code>{esc(exc)}</code>",
+            send_status(f"❌ <b>Cycle failed</b>\n<code>{esc(exc)}</code>",
                         dry_run=dry_run)
         return stats
 
-    log.info("%d filings recebidos", len(raw_filings))
+    log.info("%d filings received", len(raw_filings))
     stats["fetched"] = len(raw_filings)
 
-    # Ordem cronologica ascendente: garante que o primeiro comprador de um
-    # cluster e gravado antes de o segundo ser avaliado.
+    # Chronological ascending order: guarantees the first buyer in a cluster is
+    # recorded before the second one is evaluated.
     raw_filings.sort(key=lambda f: f.get("filedAt") or "")
 
     for raw in raw_filings:
@@ -865,10 +871,10 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
         score, why = calculate_score(txn, conn)
 
         if not passed:
-            # Grava mesmo assim: alimenta a deteccao de cluster.
+            # Record it anyway: this feeds cluster detection.
             record_transaction(conn, txn, score, alerted=False)
             stats["filtered"] += 1
-            log.debug("filtrado %s: %s", txn["ticker"], reason)
+            log.debug("filtered %s: %s", txn["ticker"], reason)
             continue
 
         log.info(
@@ -886,17 +892,17 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
         if sent:
             record_alert(conn, txn, score)
             stats["alerts"] += 1
-            time.sleep(0.4)  # margem para o flood limit do Telegram
+            time.sleep(0.4)  # headroom for the Telegram flood limit
 
     elapsed = time.monotonic() - started
     stats["duration"] = elapsed
 
-    log.info("ciclo: %d filings, %d alertas, %d repetidos, %d filtrados em %s",
+    log.info("cycle: %d filings, %d alerts, %d duplicates, %d filtered in %s",
              stats["fetched"], stats["alerts"], stats["skipped"],
              stats["filtered"], _fmt_duration(elapsed))
 
-    # So agora se marca a corrida como bem sucedida. Se o fetch tivesse
-    # falhado, o proximo ciclo volta a cobrir esta janela.
+    # Only now is the run marked successful. Had the fetch failed, the next
+    # cycle would cover this window again.
     set_meta(conn, LAST_RUN_KEY, _utc_now_iso())
 
     should_report = (
@@ -905,11 +911,11 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
     )
     if should_report:
         send_status(
-            f"✅ <b>Ciclo concluido</b> em {_fmt_duration(elapsed)}\n"
-            f"\U0001F4E5 {stats['fetched']} filings analisados\n"
-            f"\U0001F514 {stats['alerts']} alerta(s) enviado(s)\n"
-            f"\U0001F501 {stats['skipped']} repetido(s)\n"
-            f"\U0001F6AB {stats['filtered']} filtrado(s)",
+            f"✅ <b>Cycle finished</b> in {_fmt_duration(elapsed)}\n"
+            f"\U0001F4E5 {stats['fetched']} filings analysed\n"
+            f"\U0001F514 {stats['alerts']} alert(s) sent\n"
+            f"\U0001F501 {stats['skipped']} duplicate(s)\n"
+            f"\U0001F6AB {stats['filtered']} filtered",
             dry_run=dry_run,
         )
 
@@ -917,16 +923,16 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
 
 
 def sleep_seconds() -> tuple[int, str]:
-    """Cadencia por horario NYSE (so usada no modo --loop)."""
+    """Cadence by NYSE hours (only used in --loop mode)."""
     now = datetime.now(NY_TZ)
     if now.weekday() >= 5:
-        return 3600, "fim de semana"
+        return 3600, "weekend"
     minutes = now.hour * 60 + now.minute
     if 9 * 60 + 30 <= minutes < 16 * 60:
-        return 300, "mercado aberto"
+        return 300, "market hours"
     if 16 * 60 <= minutes < 18 * 60 + 30:
-        return 120, "pos-fecho (pico de filings)"
-    return 1800, "fora de horas"
+        return 120, "post-close (filing peak)"
+    return 1800, "off hours"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -943,39 +949,98 @@ def check_config(dry_run: bool) -> None:
         if not TELEGRAM_CHAT_ID:
             missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        log.error("Variaveis de ambiente em falta: %s", ", ".join(missing))
+        log.error("Missing environment variables: %s", ", ".join(missing))
         sys.exit(2)
 
 
+def test_telegram() -> int:
+    """
+    Send ONE test message and show Telegram's raw response, including the chat
+    and topic the message actually landed in. Ignores --dry-run: the whole point
+    is to really send.
+    """
+    log_destination()
+
+    payload = with_topic({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": ("\U0001F9EA <b>Connection test</b>\n"
+                 "If you are reading this in the right topic, everything works."),
+        "parse_mode": "HTML",
+    })
+    log.info("Payload: %s", json.dumps({k: v for k, v in payload.items() if k != "text"}))
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+    except Exception as exc:
+        log.error("Could not reach the Telegram API: %s", exc)
+        return 1
+
+    log.info("HTTP %s", resp.status_code)
+    try:
+        data = resp.json()
+    except ValueError:
+        log.error("Non-JSON response: %s", resp.text[:300])
+        return 1
+
+    if not data.get("ok"):
+        log.error("Telegram refused: %s - %s",
+                  data.get("error_code"), data.get("description"))
+        return 1
+
+    result = data.get("result", {})
+    chat   = result.get("chat", {})
+    thread = result.get("message_thread_id")
+
+    log.info("SENT successfully")
+    log.info("  chat:  %s (%s)", chat.get("title") or chat.get("username"), chat.get("id"))
+    log.info("  topic: %s", thread if thread is not None else
+             "General (the message did NOT go to a topic)")
+
+    if TELEGRAM_TOPIC_ID and str(thread) != str(TELEGRAM_TOPIC_ID):
+        log.error("  MISMATCH: you asked for topic %s but it landed in %s",
+                  TELEGRAM_TOPIC_ID, thread)
+        return 1
+    return 0
+
+
 def log_destination() -> None:
-    """Diz no arranque para onde vao as mensagens. Sem isto, 'foi para o
-    canal errado' obriga a adivinhar se o problema e o secret, o workflow
-    ou o codigo."""
-    chat = TELEGRAM_CHAT_ID or "(VAZIO)"
+    """State the delivery target at startup. Without this, "it went to the wrong
+    channel" means guessing whether the problem is the secret, the workflow, or
+    the code."""
+    chat = TELEGRAM_CHAT_ID or "(EMPTY)"
     if TELEGRAM_TOPIC_ID:
         topic = TELEGRAM_TOPIC_ID
         if not TELEGRAM_TOPIC_ID.lstrip("-").isdigit():
-            topic += "  <-- NAO E UM NUMERO, vai ser ignorado"
+            topic += "  <-- NOT A NUMBER, will be ignored"
     else:
-        topic = "(NENHUM -> as mensagens vao para o topico General)"
-    log.info("Destino Telegram: chat=%s | topico=%s", chat, topic)
-    log.info("Mensagens de estado: %s%s", STATUS_MESSAGES,
-             f" (topico {STATUS_TOPIC_ID})" if STATUS_TOPIC_ID else "")
-    log.info("Penalizacao 10b5-1: -%d | valor minimo: $%s",
+        topic = "(NONE -> messages go to the General topic)"
+    log.info("Telegram target: chat=%s | topic=%s", chat, topic)
+    log.info("Status messages: %s%s", STATUS_MESSAGES,
+             f" (topic {STATUS_TOPIC_ID})" if STATUS_TOPIC_ID else "")
+    log.info("10b5-1 penalty: -%d | minimum value: $%s",
              SCORE_PENALTY_10B5, f"{MIN_TRANSACTION_VALUE_USD:,}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="SEC Insider Trading Alert Bot")
     parser.add_argument("--loop", action="store_true",
-                        help="corre continuamente (para VPS). Default: um ciclo e sai.")
+                        help="run continuously (for a VPS). Default: one cycle, then exit.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="imprime os alertas em vez de os enviar")
+                        help="print alerts instead of sending them")
     parser.add_argument("--lookback", type=int, default=None,
-                        help="forca a janela em minutos. Por omissao e calculada "
-                             "a partir da ultima corrida bem sucedida.")
-    parser.add_argument("--db", default=DB_PATH, help="caminho da SQLite")
+                        help="force the window in minutes. By default it is derived "
+                             "from the last successful run.")
+    parser.add_argument("--db", default=DB_PATH, help="SQLite path")
+    parser.add_argument("--test-telegram", action="store_true",
+                        help="send one test message, report where it landed, then exit")
     args = parser.parse_args(argv)
+
+    if args.test_telegram:
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are required for the test")
+            return 2
+        return test_telegram()
 
     check_config(args.dry_run)
     log_destination()
@@ -984,24 +1049,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.loop:
         stats = process_cycle(conn, args.lookback, dry_run=args.dry_run)
         conn.close()
-        # Sai com codigo 1 se o ciclo falhou, para o Actions marcar a corrida
-        # como falhada em vez de verde-com-erro-escondido.
+        # Exit 1 when the cycle failed, so Actions marks the run as failed
+        # instead of green-with-a-hidden-error.
         return 1 if stats.get("error") else 0
 
-    log.info("modo loop")
+    log.info("loop mode")
     cycle = 0
     while True:
         cycle += 1
         try:
             secs, slot = sleep_seconds()
-            log.info("── ciclo %d │ %s ──", cycle, slot)
+            log.info("── cycle %d │ %s ──", cycle, slot)
             process_cycle(conn, args.lookback, dry_run=args.dry_run)
             time.sleep(secs)
         except KeyboardInterrupt:
-            log.info("parado pelo utilizador")
+            log.info("stopped by user")
             return 0
         except Exception as exc:
-            log.error("erro inesperado no ciclo %d: %s", cycle, exc, exc_info=True)
+            log.error("unexpected error in cycle %d: %s", cycle, exc, exc_info=True)
             time.sleep(60)
 
 

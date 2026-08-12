@@ -1,37 +1,37 @@
-# SEC Insider Trading Alert Bot v1.1
+# SEC Insider Trading Alert Bot v1.2
 
-Alertas no Telegram sobre compras de mercado aberto (Form 4, código `P`) reportadas por insiders à SEC. Corre em GitHub Actions por cron — sem servidor, sem custos.
+Telegram alerts for open-market insider purchases (SEC Form 4, code `P`). Runs on GitHub Actions cron — no server, no hosting cost.
 
-> **Não é conselho financeiro.** O score é heurístico e **não foi testado historicamente**. Ver [Limitações](#limitações-que-deves-conhecer).
+> **Not financial advice.** The score is heuristic and **has never been backtested**. See [Limitations](#limitations-you-should-know-about).
 
 ---
 
-## O que mudou da v1.0
+## What changed from v1.0
 
-| # | Bug na v1.0 | Correção |
+| # | v1.0 bug | Fix |
 |---|---|---|
-| 1 | Endpoint `/form-4` e query `query_string` aninhada — a API não aceita nenhum dos dois | `/insider-trading` com query Lucene em string |
-| 2 | Field paths errados: `raw["ticker"]`, `transactionCoding.transactionCode`, `transactionAmounts.transactionShares` | `issuer.tradingSymbol`, `coding.code`, `amounts.shares` |
-| 3 | `datetime.utcnow()` comparado com `filedAt` em horário de NY → query devolvia vazio quase sempre | Filtragem local com datetimes aware + paginação até ao cutoff |
-| 4 | `_esc()` escrita para MarkdownV2 e nunca chamada, com `parse_mode: HTML` → "Procter & Gamble" dava erro 400 | `html.escape()` aplicado a todos os campos dinâmicos |
-| 5 | `sec_url` usava o ticker como CIK → link sempre 404 | URL do EDGAR construído a partir de `issuer.cik` + accession |
-| 6 | Só a primeira linha `P` do filing era lida | Agrega todas as linhas `P`/`A`, com preço médio ponderado |
-| 7 | 10b5-1 detectado por `str(raw).lower()` | Campo oficial `aff10b5One` (+ fallback nas footnotes) |
-| 8 | Cluster: comparava `YYYY-MM-DD` com timestamp ISO, contava filings em vez de pessoas, e lia só de alertas enviados | Compara datas com datas, conta insiders distintos, grava **todas** as transações vistas |
-| 9 | `RateLimitError` usada antes de ser definida | Definida no topo |
-| 10 | `while True` no Colab — morre quando a runtime desconecta | Um ciclo por invocação (`--once`), com `--loop` opcional |
-| 11 | Chaves hardcoded no ficheiro | Tudo via variáveis de ambiente |
+| 1 | Endpoint `/form-4` and a nested `query_string` object — the API accepts neither | `/insider-trading` with a plain Lucene query string |
+| 2 | Wrong field paths: `raw["ticker"]`, `transactionCoding.transactionCode`, `transactionAmounts.transactionShares` | `issuer.tradingSymbol`, `coding.code`, `amounts.shares` |
+| 3 | `datetime.utcnow()` compared against `filedAt` in New York time → the query returned almost nothing | Local filtering with timezone-aware datetimes plus pagination to the cutoff |
+| 4 | `_esc()` written for MarkdownV2 and never called, with `parse_mode: HTML` → "Procter & Gamble" produced a 400 | `html.escape()` on every dynamic field |
+| 5 | `sec_url` used the ticker as the CIK → every link 404'd | EDGAR URL built from `issuer.cik` + accession number |
+| 6 | Only the first `P` row per filing was read | Aggregates all `P`/`A` rows with a share-weighted average price |
+| 7 | 10b5-1 detected via `str(raw).lower()` | Official `aff10b5One` field (with a footnote fallback) |
+| 8 | Cluster detection compared `YYYY-MM-DD` against an ISO timestamp, counted filings instead of people, and read only from sent alerts | Dates against dates, distinct insiders, reads **every** recorded transaction |
+| 9 | `RateLimitError` used before it was defined | Defined at the top |
+| 10 | `while True` on Colab — dies when the runtime disconnects | One cycle per invocation, with an optional `--loop` |
+| 11 | Credentials hardcoded in the file | Everything via environment variables |
 
-Extras: retry com backoff exponencial, tratamento do flood limit do Telegram, breakdown do score em cada alerta (`+3 CEO/CFO, +3 valor >= $500k`), filtro de `acquiredDisposedCode` para não deixar passar disposições, `--dry-run`, e 74 testes com fixtures.
+Added since: adaptive lookback, cycle status messages, forum-topic routing, exponential backoff, Telegram flood-limit handling, a score breakdown on every alert (`+3 CEO/CFO, +3 value >= $500k`), `acquiredDisposedCode` filtering, `--dry-run`, `--test-telegram`, and 74 fixture tests.
 
 ---
 
 ## Setup
 
-### 1. Repositório
+### 1. Repository
 
 ```
-o-teu-repo/
+your-repo/
 ├── insider_bot.py
 ├── test_bot.py
 ├── requirements.txt
@@ -39,186 +39,202 @@ o-teu-repo/
 └── .github/workflows/insider-bot.yml
 ```
 
-O repo pode ser privado — GitHub Actions funciona igual (2000 min/mês grátis; este bot usa ~30s por corrida).
+Private repos work fine (2,000 Actions minutes/month on the Free plan; see [budget](#cadence-and-minute-budget)).
 
 ### 2. Telegram
 
-1. `@BotFather` → `/newbot` → guarda o token
-2. Manda uma mensagem qualquer ao teu bot
-3. Vai a `https://api.telegram.org/bot<TOKEN>/getUpdates` → copia `message.chat.id`
+1. `@BotFather` → `/newbot` → save the token
+2. Send any message to your bot
+3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` → copy `message.chat.id`
 
 ### 3. Secrets
 
 **Settings → Secrets and variables → Actions → New repository secret:**
 
-| Secret | Valor |
+| Secret | Value |
 |---|---|
-| `SEC_API_KEY` | chave da [sec-api.io](https://sec-api.io) |
-| `TELEGRAM_TOKEN` | token do @BotFather |
-| `TELEGRAM_CHAT_ID` | o teu chat id (supergrupos começam por `-100`) |
-| `TELEGRAM_TOPIC_ID` | **opcional** — só para supergrupos com tópicos |
+| `SEC_API_KEY` | key from [sec-api.io](https://sec-api.io) |
+| `TELEGRAM_TOKEN` | token from @BotFather |
+| `TELEGRAM_CHAT_ID` | your chat id (supergroups start with `-100`) |
+| `TELEGRAM_TOPIC_ID` | **optional** — forum supergroups only |
+| `STATUS_TOPIC_ID` | **optional** — separate topic for status messages |
 
-### Enviar para um tópico específico (supergrupo com forum)
+### Posting to a specific topic (forum supergroup)
 
-Se o bot está num grupo com tópicos activados, sem `TELEGRAM_TOPIC_ID` as mensagens caem no tópico *General*. Para as encaminhar:
+Without `TELEGRAM_TOPIC_ID`, messages land in the *General* topic. To route them:
 
-1. Adiciona o bot ao grupo (basta ser membro; admin também serve)
-2. Escreve uma mensagem qualquer **dentro do tópico** que queres usar
-3. Abre `https://api.telegram.org/bot<TOKEN>/getUpdates`
-4. Nessa mensagem, copia o `message_thread_id` → é o `TELEGRAM_TOPIC_ID`
-5. O `chat.id` do mesmo objecto é o `TELEGRAM_CHAT_ID` (negativo, começa por `-100`)
+1. Add the bot to the group (member is enough; admin also works)
+2. Post any message **inside** the topic you want to use
+3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates`
+4. On that message, copy `message_thread_id` → that is your `TELEGRAM_TOPIC_ID`
+5. The `chat.id` on the same object is your `TELEGRAM_CHAT_ID` (negative, starts with `-100`)
 
-### 4. Primeira corrida
+### 4. First run
 
-**Actions → Insider Alert Bot → Run workflow**, com `dry_run: true` e `lookback: 240`. Os alertas aparecem no log em vez de irem para o Telegram. Se estiverem bem, corre outra vez com `dry_run: false`.
+**Actions → Insider Alert Bot → Run workflow.**
 
----
+Three ways to run it, in the order worth trying:
 
-## Como funciona a persistência
-
-GitHub Actions não tem disco persistente. A SQLite é guardada num branch órfão `bot-state` (só o ficheiro `.db`, force-push a cada corrida) e restaurada no início da corrida seguinte. Um artifact serve de backup com 14 dias de retenção.
-
-Isto é o que torna o dedup e a detecção de cluster possíveis entre corridas. Se apagares o branch `bot-state`, o bot arranca a frio e pode repetir alertas recentes.
-
-O `concurrency: insider-bot` impede duas corridas simultâneas de escreverem na DB e perderem escritas.
-
----
-
-## Cadência e orçamento de minutos
-
-| Janela (ET) | Frequência | Corridas/dia |
-|---|---|---|
-| 09:00–16:00, seg-sex | 30 min | 14 |
-| 16:00–19:00, seg-sex | 15 min | 12 |
-| 22:00 ET (noite) | 1x | 1 |
-| sábado 01:00 ET | 1x (catch-up de sexta) | 1 |
-
-**~28 corridas/dia útil, ~590/mês.** A 1–2 minutos facturados cada, fica em 600–1200 dos 2.000 min/mês incluídos no plano Free para repos privados. Sobra espaço para mais 1–2 bots.
-
-A frequência é deliberadamente baixa. O Form 4 tem prazo de entrega de 2 dias úteis e fica público para todos ao mesmo tempo — chegar 20 minutos depois não muda nada num sinal de horizonte de meses. Correr de 10 em 10 minutos gastava a quota toda sem melhorar o sinal.
-
-### Lookback adaptativo
-
-O bot guarda na tabela `meta` a hora da última corrida **bem sucedida** e calcula a janela a partir daí, mais 25 minutos de margem:
-
-- corrida normal (30 min de intervalo) → janela de ~55 min
-- corrida falhada anteriormente → a janela seguinte cobre as duas
-- fim de semana (60h) → janela de 60h, truncada em `MAX_LOOKBACK_MINUTES` (3 dias)
-- primeira corrida → `LOOKBACK_MINUTES` (90 min)
-
-O número de páginas pedidas à SEC-API escala com a janela (`pages_for`), com teto em `MAX_PAGES_CATCHUP` para não estourar a quota da API num catch-up grande.
-
-Isto elimina a classe de bugs "perdi filings porque o cron não correu". A hora só é gravada **depois** de o ciclo correr bem — se a API falhar, a janela seguinte volta a cobrir o mesmo período.
-
-## Mensagens de estado
-
-`STATUS_MESSAGES` controla os avisos de início/fim de ciclo:
-
-| Valor | Comportamento |
+| Input | What it does |
 |---|---|
-| `always` | mensagem no início e no fim de cada ciclo |
-| `summary` | só no fim, e apenas se houve alertas ou erro |
-| `errors` | só quando algo falha |
-| `off` | nunca (default do código) |
-
-São sempre **silenciosas** (sem notificação no telefone) — são ~56/dia com `always`. Para as separar dos alertas, cria um tópico só para estado no grupo e define `STATUS_TOPIC_ID`.
+| `test_telegram: true` | sends one test message and logs **which chat and topic it landed in**. Start here |
+| `dry_run: true` | full cycle against live SEC data, alerts printed to the log only |
+| defaults | live |
 
 ---
 
-## Configuração
+## How persistence works
 
-Todas as variáveis são opcionais menos as três chaves.
+GitHub Actions has no persistent disk. The SQLite file is stored on an orphan branch called `bot-state` (just the `.db`, force-pushed each run) and restored at the start of the next run.
 
-| Variável | Default | O que faz |
+That is what makes dedup and cluster detection work across runs. Delete the `bot-state` branch and the bot cold-starts, possibly repeating recent alerts.
+
+`concurrency: insider-bot` stops two simultaneous runs from clobbering each other's writes.
+
+---
+
+## Cadence and minute budget
+
+| Window (ET) | Frequency | Runs/day |
 |---|---|---|
-| `MIN_TRANSACTION_VALUE_USD` | `25000` | ignora compras abaixo deste valor |
-| `CLUSTER_WINDOW_DAYS` | `7` | janela para detectar cluster buying |
-| `SCORE_MIN_TO_SEND` | `1` | abaixo disto nem envia (grava só na DB) |
-| `SCORE_SILENT_BELOW` | `3` | envia sem notificação sonora |
-| `SCORE_MAX_ALERT_FROM` | `6` | 🚨 MAX ALERT |
-| `LOOKBACK_MINUTES` | `90` | janela de arranque a frio |
-| `LOOKBACK_BUFFER_MINUTES` | `25` | margem para atrasos do cron |
-| `MAX_LOOKBACK_MINUTES` | `4320` | teto do catch-up (3 dias) |
-| `MAX_PAGES` | `6` | páginas de 50 filings por corrida |
-| `MAX_PAGES_CATCHUP` | `30` | teto de páginas em catch-up |
+| 09:00–16:00, Mon-Fri | 30 min | 14 |
+| 16:00–19:00, Mon-Fri | 15 min | 12 |
+| 22:00 ET (evening) | 1x | 1 |
+| Saturday 01:00 ET | 1x (Friday catch-up) | 1 |
+
+**~28 runs/weekday, ~590/month.** At 1–2 billed minutes each, that is 600–1200 of the 2,000 min/month included on the Free plan for private repos. Room left for another bot or two.
+
+The frequency is deliberately low. Form 4 has a two-business-day filing deadline and becomes public to everyone simultaneously — arriving 20 minutes later changes nothing for a signal measured in months. Running every 10 minutes burned the entire quota without improving the signal.
+
+### Adaptive lookback
+
+The bot stores the last **successful** run in the `meta` table and derives the window from it, plus a 25-minute margin:
+
+- normal run (30 min gap) → ~55 min window
+- previous run failed → the next window covers both
+- weekend (60h) → 60h window, truncated at `MAX_LOOKBACK_MINUTES` (3 days)
+- first ever run → `LOOKBACK_MINUTES` (90 min)
+
+The number of pages requested from the SEC-API scales with the window (`pages_for`), capped at `MAX_PAGES_CATCHUP` so a large catch-up cannot blow through your API quota.
+
+This eliminates the "I lost filings because the cron did not fire" class of bug. The timestamp is written **after** a successful cycle — if the API fails, the next window covers the same period again.
+
+## Status messages
+
+`STATUS_MESSAGES` controls the cycle start/finish notices:
+
+| Value | Behaviour |
+|---|---|
+| `always` | a message at the start and end of every cycle |
+| `summary` | finish only, and only when there were alerts or an error |
+| `errors` | only when something fails |
+| `off` | never (code default) |
+
+They are always **silent** (no phone notification) — with `always` there are ~56/day. To keep them out of the alert feed, create a dedicated topic and set `STATUS_TOPIC_ID`.
+
+---
+
+## Configuration
+
+Everything is optional except the three credentials.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MIN_TRANSACTION_VALUE_USD` | `25000` | ignore purchases below this value |
+| `CLUSTER_WINDOW_DAYS` | `7` | window for cluster-buy detection |
+| `SCORE_MIN_TO_SEND` | `1` | below this, log only (no message) |
+| `SCORE_SILENT_BELOW` | `3` | send without a notification |
+| `SCORE_MAX_ALERT_FROM` | `6` | 🚨 MAX ALERT threshold |
+| `SCORE_PENALTY_10B5` | `0` | points to subtract from 10b5-1 plan purchases |
+| `LOOKBACK_MINUTES` | `90` | cold-start window |
+| `LOOKBACK_BUFFER_MINUTES` | `25` | margin for cron delays |
+| `MAX_LOOKBACK_MINUTES` | `4320` | catch-up ceiling (3 days) |
+| `MAX_PAGES` | `6` | pages of 50 filings per run |
+| `MAX_PAGES_CATCHUP` | `30` | page ceiling during catch-up |
 | `STATUS_MESSAGES` | `off` | `always` / `summary` / `errors` / `off` |
-| `STATUS_TOPIC_ID` | — | tópico separado para mensagens de estado |
-| `TELEGRAM_TOPIC_ID` | — | tópico de destino em supergrupos com forum |
-| `SCORE_PENALTY_10B5` | `0` | pontos a subtrair a compras de plano 10b5-1 |
-| `FINVIZ_INSIDER_URL` | `finviz.com/insidertrading?tc=7` | link do botão de últimas compras |
-| `VERBOSE` | `false` | logging DEBUG |
-
-### Botões de cada alerta
-
-| Botão | Para quê |
-|---|---|
-| 📈 TradingView | gráfico do ticker |
-| 📄 Filing SEC | fonte primária, o Form 4 em si |
-| 📰 Investing.com | notícias e contexto da empresa |
-| 🔍 Finviz | fundamentais + histórico de insider do ticker |
-| 👀 Últimas compras de insiders | feed global de compras recentes no mercado |
+| `TELEGRAM_TOPIC_ID` | — | destination topic in forum supergroups |
+| `STATUS_TOPIC_ID` | — | separate topic for status messages |
+| `FINVIZ_INSIDER_URL` | `finviz.com/insidertrading?tc=7` | target of the "latest buys" button |
+| `VERBOSE` | `false` | DEBUG logging |
 
 ## Scoring
 
-| Critério | Pontos |
+| Criterion | Points |
 |---|---|
 | CEO / CFO | +3 |
-| Director / VP / outro officer | +1 |
-| Valor ≥ $500k | +3 |
-| Valor ≥ $100k | +1 |
-| Aumento de posição ≥ 20% | +2 |
-| Cluster: outro insider comprou nos últimos 7d | +3 |
+| Director / VP / other officer | +1 |
+| Value ≥ $500k | +3 |
+| Value ≥ $100k | +1 |
+| Position increase ≥ 20% | +2 |
+| Cluster: another insider bought within 7d | +3 |
+| 10b5-1 plan purchase | `-SCORE_PENALTY_10B5` (default 0) |
 
-Cada alerta traz o breakdown para poderes auditar porque apareceu.
+Every alert carries its breakdown so you can audit why it fired.
+
+### Buttons on each alert
+
+| Button | Purpose |
+|---|---|
+| 📈 TradingView | chart for the ticker |
+| 📄 SEC filing | primary source, the Form 4 itself |
+| 📰 Investing.com | news and company context |
+| 🔍 Finviz | fundamentals + insider history for the ticker |
+| 👀 Latest insider buys | market-wide feed of recent buys |
 
 ---
 
-## Testar localmente
+## Testing locally
 
 ```bash
 pip install -r requirements.txt
-python test_bot.py                              # 74 testes, sem rede
+python test_bot.py                       # 74 tests, no network
 
 export SEC_API_KEY="..."
-python insider_bot.py --dry-run --lookback 240  # dados reais, imprime em vez de enviar
+python insider_bot.py --dry-run          # live data, prints instead of sending
+
+export TELEGRAM_TOKEN="..." TELEGRAM_CHAT_ID="..."
+python insider_bot.py --test-telegram    # one message, reports where it landed
 ```
 
-Inspeccionar a base de dados:
+Inspecting the database:
 
 ```bash
 sqlite3 state/alerts.db "
   SELECT ticker, insider_name, title, total_value, score, is_10b5, alerted
   FROM transactions ORDER BY recorded_at DESC LIMIT 20;"
+
+sqlite3 state/alerts.db "SELECT * FROM meta;"   -- last successful run
 ```
 
-Para VPS em vez de Actions: `python insider_bot.py --loop`.
+For a VPS instead of Actions: `python insider_bot.py --loop`.
 
 ---
 
-## Limitações que deves conhecer
+## Limitations you should know about
 
-Estas não são bugs — são propriedades do sinal. Valem mais do que o código.
+These are not bugs — they are properties of the signal. They matter more than the code.
 
-**O sinal não é rápido, é lento.** O Form 4 é entregue até 2 dias úteis depois da transacção e fica público para todos ao mesmo tempo. Não há vantagem de velocidade a ganhar aqui. A literatura académica (Lakonishok & Lee; Cohen, Malloy & Pomorski sobre "insiders oportunistas") aponta para retornos anormais **modestos, em horizontes de 6 a 12 meses**. Alertas a cada 10 minutos são úteis para não perderes o filing, não para fazer scalping.
+**The signal is slow, not fast.** Form 4 is filed up to two business days after the trade and becomes public to everyone at once. There is no speed advantage to capture. The academic literature (Lakonishok & Lee; Cohen, Malloy & Pomorski on "opportunistic insiders") points to **modest abnormal returns over 6 to 12 months**. Ten-minute alerts help you not miss the filing, not scalp it.
 
-**Falta normalização por market cap.** Uma compra de $100k numa nano-cap é enorme; na Apple é irrelevante. O score actual trata as duas de forma idêntica — é o maior defeito que resta. Fase 2.
+**No market-cap normalisation.** A $100k purchase in a nano-cap is enormous; in Apple it is noise. The current score treats them identically — the biggest weakness that remains. Phase 2.
 
-**Não há sinal de venda.** Insiders vendem por impostos, diversificação, divórcio, planos automáticos. Compras informam; vendas informam muito menos. Qualquer regra de saída tem de vir de ti (horizonte fixo, trailing stop, alvo), não dos dados de insider.
+**There is no sell signal.** Insiders sell for taxes, diversification, divorce, scheduled plans. Purchases inform; sales inform much less. Any exit rule has to come from you (fixed horizon, trailing stop, target), not from insider data.
 
-**O score não foi backtestado.** Os pesos são heurísticas plausíveis, não resultado de medição. Podem estar a pontuar ruído. Até correr a Fase 3, trata o score como "isto merece que eu olhe", não como "isto vai subir".
+**The score has not been backtested.** The weights are plausible heuristics, not measurements. They may be scoring noise. Until Phase 3 runs, treat the score as "this deserves a look", not "this will go up".
 
-**Legal:** negociar com base em Form 4 públicos é legal — não é insider trading. Insider trading é negociar com informação material **não pública**.
+**Legal note:** trading on public Form 4 filings is legal — it is not insider trading. Insider trading means trading on material **non-public** information.
 
 ---
 
-## Próximos passos
+## Roadmap
 
-- **Fase 2 — enriquecer:** market cap (yfinance), preço vs MM50/MM200, capturar vendas (`S`), agrupar filings do mesmo dia por ticker
-- **Fase 3 — backtestar:** bulk archives da sec-api (`/bulk/form-4/YYYY/YYYY-MM.jsonl.gz`) + preços históricos; retorno a 1/5/21/63/126 dias por bucket de score. Isto responde se o score serve para algo
-- **Fase 4 — sinais:** só se a Fase 3 mostrar edge. Entrada + saída explícitas, sizing, e paper trading antes de dinheiro real
+- **Phase 2 — enrich:** market cap (yfinance), price vs 50/200-day MA, capture sales (`S`), group same-day filings by ticker
+- **Phase 3 — backtest:** sec-api bulk archives (`/bulk/form-4/YYYY/YYYY-MM.jsonl.gz`) + historical prices; returns at 1/5/21/63/126 days per score bucket. This answers whether the score is worth anything
+- **Phase 4 — signals:** only if Phase 3 shows an edge. Explicit entry and exit, position sizing, and paper trading before real money
 
-## Fontes
+## Sources
 
 - [Insider Trading Data from SEC Form 3, 4, 5 Filings — sec-api.io](https://sec-api.io/docs/insider-ownership-trading-api)
 - [Analyze SEC Form 4 Insider Trades with Python — sec-api.io](https://sec-api.io/docs/insider-ownership-trading-api/python-example)
 - [Form 4 Bulk Dataset — sec-api.io](https://sec-api.io/datasets/form-4)
+- [GitHub Actions billing — GitHub Docs](https://docs.github.com/billing/managing-billing-for-github-actions/about-billing-for-github-actions)
