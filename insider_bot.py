@@ -95,9 +95,43 @@ DB_PATH = os.environ.get("DB_PATH", "state/alerts.db")
 
 MIN_TRANSACTION_VALUE_USD = _env_int("MIN_TRANSACTION_VALUE_USD", 25_000)
 CLUSTER_WINDOW_DAYS       = _env_int("CLUSTER_WINDOW_DAYS", 7)
-SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 1)   # below this, log only
-SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 3)  # send without notification
-SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 6)
+SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 9)   # below this, log only
+SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 10) # send without notification
+SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 13)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_list(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
+    return {t.strip().upper() for t in raw.split(",") if t.strip()}
+
+
+# ── Hard filters: applied before scoring, they drop a filing entirely ──
+# Penny stocks are the single largest source of Form 4 noise.
+MIN_PRICE            = _env_float("MIN_PRICE", 1.0)
+# Skip 10b5-1 plan purchases outright (scheduled months ahead, low information).
+EXCLUDE_10B5         = _env_bool("EXCLUDE_10B5", False)
+# Require direct ownership (personal money, not via trust/LLC/partnership).
+REQUIRE_DIRECT       = _env_bool("REQUIRE_DIRECT", False)
+# Minimum position increase, in percent. 0 = off.
+MIN_POSITION_INCREASE = _env_float("MIN_POSITION_INCREASE", 0.0)
+# Market-cap bounds in USD. 0 = off. Needs ENABLE_MARKET_DATA.
+MIN_MARKET_CAP       = _env_float("MIN_MARKET_CAP", 0)
+MAX_MARKET_CAP       = _env_float("MAX_MARKET_CAP", 0)
+# Ticker allow/deny lists, comma separated. ONLY_TICKERS acts as a watchlist.
+ONLY_TICKERS         = _env_list("ONLY_TICKERS")
+EXCLUDE_TICKERS      = _env_list("EXCLUDE_TICKERS")
+
+# Market data (yfinance) powers market-cap normalisation and 52-week context.
+# Degrades gracefully: if the lookup fails, those points simply are not awarded.
+ENABLE_MARKET_DATA   = _env_bool("ENABLE_MARKET_DATA", True)
+MARKET_CACHE_HOURS   = _env_int("MARKET_CACHE_HOURS", 168)  # 7 days
 
 # Penalty for purchases made under a 10b5-1 plan: they were scheduled months in
 # advance, so they say far less about the insider's current view. Default 0 (no
@@ -174,6 +208,17 @@ CREATE INDEX IF NOT EXISTS idx_txn_ticker_date
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Market data cache. Market caps move slowly, and every lookup is a network
+-- round trip that can fail, so cache aggressively.
+CREATE TABLE IF NOT EXISTS market_cache (
+    ticker      TEXT PRIMARY KEY,
+    market_cap  REAL,
+    price       REAL,
+    low_52w     REAL,
+    high_52w    REAL,
+    fetched_at  TEXT NOT NULL
 );
 """
 
@@ -433,6 +478,7 @@ def _parse(raw: dict) -> Optional[dict]:
     total_cost   = 0.0
     post_qty     = 0
     trade_dates: list[str] = []
+    is_direct    = False
 
     for row in purchases:
         amounts = row.get("amounts") or {}
@@ -447,11 +493,21 @@ def _parse(raw: dict) -> Optional[dict]:
         post_qty = max(post_qty, int(post))
         if row.get("transactionDate"):
             trade_dates.append(row["transactionDate"])
+        # "D" = direct: the insider's own money, not a trust, LLC or spouse.
+        if ((row.get("ownershipNature") or {})
+                .get("directOrIndirectOwnership", "").upper() == "D"):
+            is_direct = True
 
     if total_shares <= 0:
         return None
 
     avg_price = total_cost / total_shares
+
+    # Position increase, computed here rather than during scoring because the
+    # filters need it too. None means the filing did not report a usable
+    # post-transaction total (or it was a first purchase).
+    pre = post_qty - int(total_shares)
+    pct_increase = round((total_shares / pre) * 100, 1) if pre > 0 else None
 
     # Official field from the SEC's 2023 amendments to Rule 10b5-1. Far more
     # reliable than string-matching "10b5-1" in the footnote text.
@@ -470,9 +526,11 @@ def _parse(raw: dict) -> Optional[dict]:
         "price":            round(avg_price, 4),
         "quantity":         int(total_shares),
         "post_qty":         post_qty,
+        "pct_increase":     pct_increase,
         "total_value":      round(total_cost, 2),
         "n_transactions":   len(purchases),
         "is_10b5":          is_10b5,
+        "is_direct":        is_direct,
         "sec_url":          _filing_url(cik, accession),
     }
 
@@ -519,11 +577,87 @@ def _safe_float(val: Any) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  MARKET DATA
+# ══════════════════════════════════════════════════════════════════
+
+def get_market_data(conn: sqlite3.Connection, ticker: str) -> Optional[dict]:
+    """
+    Market cap and 52-week range for a ticker, cached in SQLite.
+
+    This is what makes the score aware of scale: a $100k purchase in a
+    nano-cap is enormous, in Apple it is a rounding error. Without it the
+    scoring is blind to the single most important piece of context.
+
+    Returns None when unavailable. Every caller must handle that -- yfinance
+    is a scraper and will fail sometimes, and a missing market cap must never
+    take the bot down.
+    """
+    if not ENABLE_MARKET_DATA or not ticker:
+        return None
+
+    cur = conn.execute(
+        "SELECT market_cap, price, low_52w, high_52w, fetched_at "
+        "FROM market_cache WHERE ticker = ?", (ticker,)
+    )
+    row = cur.fetchone()
+    if row:
+        try:
+            age_h = (datetime.now(timezone.utc)
+                     - datetime.fromisoformat(row[4])).total_seconds() / 3600
+            if age_h < MARKET_CACHE_HOURS:
+                return {"market_cap": row[0], "price": row[1],
+                        "low_52w": row[2], "high_52w": row[3], "cached": True}
+        except ValueError:
+            pass  # unreadable timestamp, re-fetch
+
+    data = _fetch_market_data(ticker)
+    if data is None:
+        return None
+
+    conn.execute(
+        """INSERT OR REPLACE INTO market_cache
+           (ticker, market_cap, price, low_52w, high_52w, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (ticker, data["market_cap"], data["price"],
+         data["low_52w"], data["high_52w"], _utc_now_iso()),
+    )
+    conn.commit()
+    return data
+
+
+def _fetch_market_data(ticker: str) -> Optional[dict]:
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.debug("yfinance not installed - market data disabled")
+        return None
+
+    try:
+        info = yf.Ticker(ticker).fast_info
+        data = {
+            "market_cap": _safe_float(info.get("market_cap")),
+            "price":      _safe_float(info.get("last_price")),
+            "low_52w":    _safe_float(info.get("year_low")),
+            "high_52w":   _safe_float(info.get("year_high")),
+            "cached":     False,
+        }
+    except Exception as exc:
+        log.debug("market data lookup failed for %s: %s", ticker, exc)
+        return None
+
+    if data["market_cap"] <= 0 and data["price"] <= 0:
+        return None
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════
 #  FILTERS
 # ══════════════════════════════════════════════════════════════════
 
 def passes_filters(txn: dict) -> tuple[bool, str]:
-    if not txn.get("ticker"):
+    """Cheap filters: no network, applied before any market-data lookup."""
+    ticker = txn.get("ticker")
+    if not ticker:
         return False, "no ticker (likely not publicly traded)"
     if txn["price"] <= 0:
         return False, "zero price (a grant dressed up as a purchase)"
@@ -531,6 +665,41 @@ def passes_filters(txn: dict) -> tuple[bool, str]:
         return False, "zero quantity"
     if txn["total_value"] < MIN_TRANSACTION_VALUE_USD:
         return False, f"value ${txn['total_value']:,.0f} below minimum"
+
+    if MIN_PRICE > 0 and txn["price"] < MIN_PRICE:
+        return False, f"price ${txn['price']:.2f} below ${MIN_PRICE:.2f} (penny stock)"
+    if EXCLUDE_10B5 and txn.get("is_10b5"):
+        return False, "10b5-1 plan purchase (EXCLUDE_10B5)"
+    if REQUIRE_DIRECT and not txn.get("is_direct", True):
+        return False, "indirect ownership (REQUIRE_DIRECT)"
+    if ONLY_TICKERS and ticker not in ONLY_TICKERS:
+        return False, f"{ticker} not on the watchlist"
+    if EXCLUDE_TICKERS and ticker in EXCLUDE_TICKERS:
+        return False, f"{ticker} on the exclusion list"
+
+    if MIN_POSITION_INCREASE > 0:
+        pct = txn.get("pct_increase")
+        if pct is not None and pct < MIN_POSITION_INCREASE:
+            return False, f"position +{pct:.1f}% below {MIN_POSITION_INCREASE:.0f}%"
+
+    return True, "ok"
+
+
+def passes_market_filters(txn: dict) -> tuple[bool, str]:
+    """Filters that need market data. Skipped entirely when it is unavailable —
+    a failed lookup must not silently drop a good filing."""
+    market = txn.get("market")
+    if not market:
+        return True, "ok (no market data)"
+
+    cap = market.get("market_cap") or 0
+    if cap <= 0:
+        return True, "ok (no market cap)"
+
+    if MIN_MARKET_CAP > 0 and cap < MIN_MARKET_CAP:
+        return False, f"market cap ${cap / 1e6:,.0f}M below minimum"
+    if MAX_MARKET_CAP > 0 and cap > MAX_MARKET_CAP:
+        return False, f"market cap ${cap / 1e9:,.1f}B above maximum"
     return True, "ok"
 
 
@@ -540,51 +709,121 @@ def passes_filters(txn: dict) -> tuple[bool, str]:
 
 def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]]:
     """
-    Weighted score. Returns (score, breakdown). The breakdown exists so you can
-    audit why an alert fired, and so Phase 3 can test each component in
-    isolation.
+    Weighted score, maximum ~22. Returns (score, breakdown). The breakdown
+    exists so you can audit why an alert fired, and so Phase 3 can test each
+    component in isolation.
 
-    Honest note: these weights are heuristics, not backtest output. Do not read
-    the score as a probability of anything.
+    Honest note: these weights are heuristics, not backtest output. A wider
+    scale with more components looks more sophisticated but is exactly as
+    unvalidated as the narrow one was. Do not read the score as a probability.
     """
     score = 0
     why: list[str] = []
 
+    # ── Role: who is buying ───────────────────────────────────────
     title_up = (txn.get("title") or "").upper()
-    if any(k in title_up for k in ("CEO", "CHIEF EXECUTIVE", "CFO", "CHIEF FINANCIAL")):
-        score += 3
-        why.append("+3 CEO/CFO")
-    elif any(k in title_up for k in ("PRESIDENT", "VP", "VICE PRESIDENT", "DIRECTOR", "OFFICER")):
-        score += 1
-        why.append("+1 director/officer")
+    is_ceo_cfo = any(k in title_up for k in
+                     ("CEO", "CHIEF EXECUTIVE", "CFO", "CHIEF FINANCIAL"))
+    is_other_chief = "CHIEF" in title_up or "PRESIDENT" in title_up
+    is_director = "DIRECTOR" in title_up
+    is_officer = "OFFICER" in title_up or is_other_chief or "VP" in title_up
+    is_ten_pct = "10%" in title_up
 
+    if is_ceo_cfo:
+        score += 4
+        why.append("+4 CEO/CFO")
+    elif is_other_chief:
+        score += 3
+        why.append("+3 C-suite/President")
+    elif is_officer:
+        score += 2
+        why.append("+2 officer")
+
+    if is_director and not is_ceo_cfo:
+        score += 2
+        why.append("+2 director")
+    if is_ten_pct:
+        score += 2
+        why.append("+2 10% owner")
+    # Someone who is both an executive and a board member sees more than either.
+    if (is_ceo_cfo or is_officer) and is_director:
+        score += 1
+        why.append("+1 dual role")
+
+    # ── Absolute size ─────────────────────────────────────────────
     value = txn["total_value"]
-    if value >= 500_000:
+    if value >= 1_000_000:
+        score += 4
+        why.append("+4 value >= $1M")
+    elif value >= 500_000:
         score += 3
         why.append("+3 value >= $500k")
+    elif value >= 250_000:
+        score += 2
+        why.append("+2 value >= $250k")
     elif value >= 100_000:
         score += 1
         why.append("+1 value >= $100k")
 
-    post = txn.get("post_qty", 0)
-    qty  = txn["quantity"]
-    pre  = post - qty
-    if pre > 0:
-        pct = (qty / pre) * 100
-        txn["pct_increase"] = round(pct, 1)
-        if pct >= 20:
+    # ── Conviction: how much they increased their own stake ───────
+    pct = txn.get("pct_increase")
+    if pct is not None:
+        if pct >= 100:
+            score += 3
+            why.append(f"+3 position +{pct:.0f}%")
+        elif pct >= 50:
             score += 2
             why.append(f"+2 position +{pct:.0f}%")
-    else:
-        # post_qty <= qty: either a first purchase, or the filing did not report
-        # a reliable post-transaction total.
-        txn["pct_increase"] = None
+        elif pct >= 20:
+            score += 1
+            why.append(f"+1 position +{pct:.0f}%")
 
+    # ── Cluster: agreement between independent insiders ───────────
     cluster = count_cluster_insiders(conn, txn)
     txn["cluster"] = cluster
-    if cluster > 0:
+    if cluster >= 3:
+        score += 4
+        why.append(f"+4 cluster ({cluster} insiders)")
+    elif cluster == 2:
         score += 3
-        why.append(f"+3 cluster ({cluster} insider(s))")
+        why.append("+3 cluster (2 insiders)")
+    elif cluster == 1:
+        score += 2
+        why.append("+2 cluster (1 insider)")
+
+    # ── Scale: the purchase relative to the whole company ─────────
+    market = txn.get("market") or {}
+    cap = market.get("market_cap") or 0
+    if cap > 0:
+        pct_cap = (value / cap) * 100
+        txn["pct_of_market_cap"] = round(pct_cap, 4)
+        if pct_cap >= 1.0:
+            score += 3
+            why.append(f"+3 {pct_cap:.2f}% of market cap")
+        elif pct_cap >= 0.25:
+            score += 2
+            why.append(f"+2 {pct_cap:.2f}% of market cap")
+        elif pct_cap >= 0.05:
+            score += 1
+            why.append(f"+1 {pct_cap:.2f}% of market cap")
+
+    # ── Timing: buying near the lows, not chasing strength ────────
+    low = market.get("low_52w") or 0
+    price = market.get("price") or 0
+    if low > 0 and price > 0:
+        above_low = ((price - low) / low) * 100
+        txn["pct_above_52w_low"] = round(above_low, 1)
+        if above_low <= 10:
+            score += 2
+            why.append(f"+2 {above_low:.0f}% above 52w low")
+        elif above_low <= 25:
+            score += 1
+            why.append(f"+1 {above_low:.0f}% above 52w low")
+
+    # ── Personal money, not a trust or LLC ────────────────────────
+    if txn.get("is_direct"):
+        score += 1
+        why.append("+1 direct ownership")
 
     if txn.get("is_10b5") and SCORE_PENALTY_10B5:
         score -= SCORE_PENALTY_10B5
@@ -699,7 +938,21 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
     if txn.get("n_transactions", 1) > 1:
         lines.append(f"\U0001F9FE Aggregated from {txn['n_transactions']} transactions")
 
+    market = txn.get("market") or {}
+    cap = market.get("market_cap") or 0
+    if cap > 0:
+        cap_str = f"${cap / 1e9:.2f}B" if cap >= 1e9 else f"${cap / 1e6:.0f}M"
+        line = f"\U0001F3F7 Market cap:  <code>{cap_str}</code>"
+        if txn.get("pct_of_market_cap"):
+            line += f"  (buy = {txn['pct_of_market_cap']:.2f}%)"
+        lines.append(line)
+    if txn.get("pct_above_52w_low") is not None:
+        lines.append(f"\U0001F4C9 52w low:     <code>+{txn['pct_above_52w_low']:.0f}%</code> above")
+
     lines += ["", trade_type]
+
+    if txn.get("is_direct"):
+        lines.append("\U0001F464 Direct ownership (personal holding)")
 
     if txn.get("cluster", 0) > 0:
         lines.append(
@@ -867,7 +1120,13 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
             stats["skipped"] += 1
             continue
 
+        # Cheap filters first: no point paying for a market-data lookup on a
+        # filing that a free check already rejects.
         passed, reason = passes_filters(txn)
+        if passed:
+            txn["market"] = get_market_data(conn, txn["ticker"])
+            passed, reason = passes_market_filters(txn)
+
         score, why = calculate_score(txn, conn)
 
         if not passed:
@@ -1018,8 +1277,28 @@ def log_destination() -> None:
     log.info("Telegram target: chat=%s | topic=%s", chat, topic)
     log.info("Status messages: %s%s", STATUS_MESSAGES,
              f" (topic {STATUS_TOPIC_ID})" if STATUS_TOPIC_ID else "")
-    log.info("10b5-1 penalty: -%d | minimum value: $%s",
-             SCORE_PENALTY_10B5, f"{MIN_TRANSACTION_VALUE_USD:,}")
+    log.info("Alert threshold: score >= %d | min value: $%s | min price: $%.2f",
+             SCORE_MIN_TO_SEND, f"{MIN_TRANSACTION_VALUE_USD:,}", MIN_PRICE)
+    log.info("10b5-1 penalty: -%d%s | market data: %s",
+             SCORE_PENALTY_10B5,
+             " (excluded entirely)" if EXCLUDE_10B5 else "",
+             "on" if ENABLE_MARKET_DATA else "off")
+
+    extra = []
+    if REQUIRE_DIRECT:
+        extra.append("direct ownership required")
+    if MIN_POSITION_INCREASE > 0:
+        extra.append(f"position >= +{MIN_POSITION_INCREASE:.0f}%")
+    if MIN_MARKET_CAP > 0:
+        extra.append(f"market cap >= ${MIN_MARKET_CAP / 1e6:,.0f}M")
+    if MAX_MARKET_CAP > 0:
+        extra.append(f"market cap <= ${MAX_MARKET_CAP / 1e9:,.1f}B")
+    if ONLY_TICKERS:
+        extra.append(f"watchlist: {','.join(sorted(ONLY_TICKERS))}")
+    if EXCLUDE_TICKERS:
+        extra.append(f"excluded: {','.join(sorted(EXCLUDE_TICKERS))}")
+    if extra:
+        log.info("Extra filters: %s", " | ".join(extra))
 
 
 def main(argv: Optional[list[str]] = None) -> int:

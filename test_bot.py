@@ -138,10 +138,113 @@ ok, why = bot.passes_filters(bot.parse_filing(NO_TICKER))
 check("missing ticker blocked", not ok, why)
 
 
+# ── 2b. Hard filters ──────────────────────────────────────────────
+print("\n[2b] Hard filters")
+
+PENNY = filing(
+    "0001234567-26-000010", "PENY", "Penny Corp", "999010",
+    "910", "Cheap Charlie", {"isOfficer": True, "officerTitle": "CEO"},
+    [row(200_000, 0.35, 900_000)],  # $70k but at $0.35/share
+)
+INDIRECT = filing(
+    "0001234567-26-000011", "TRST", "Trust Co", "999011",
+    "911", "Via Trust", {"isDirector": True},
+    [dict(row(10_000, 30.0, 100_000),
+          ownershipNature={"directOrIndirectOwnership": "I",
+                           "natureOfOwnership": "By family trust"})],
+)
+
+penny = bot.parse_filing(PENNY)
+indirect = bot.parse_filing(INDIRECT)
+
+check("direct ownership detected", bot.parse_filing(CEO_BIG)["is_direct"] is True)
+check("indirect ownership detected", indirect["is_direct"] is False)
+
+bot.MIN_PRICE = 1.0
+ok, why = bot.passes_filters(penny)
+check("penny stock blocked by MIN_PRICE", not ok, why)
+bot.MIN_PRICE = 0.0
+ok, _ = bot.passes_filters(penny)
+check("MIN_PRICE=0 disables the check", ok)
+bot.MIN_PRICE = 1.0
+
+bot.EXCLUDE_10B5 = True
+ok, why = bot.passes_filters(bot.parse_filing(PLAN_10B5))
+check("EXCLUDE_10B5 drops plan purchases", not ok, why)
+bot.EXCLUDE_10B5 = False
+check("10b5-1 allowed when the flag is off",
+      bot.passes_filters(bot.parse_filing(PLAN_10B5))[0])
+
+bot.REQUIRE_DIRECT = True
+ok, why = bot.passes_filters(indirect)
+check("REQUIRE_DIRECT drops trust holdings", not ok, why)
+bot.REQUIRE_DIRECT = False
+
+bot.MIN_POSITION_INCREASE = 25.0
+ok, why = bot.passes_filters(bot.parse_filing(DIRECTOR_SMALL))  # exactly +20%
+check("MIN_POSITION_INCREASE blocks a small top-up", not ok, why)
+bot.MIN_POSITION_INCREASE = 0.0
+
+bot.ONLY_TICKERS = {"NVDA", "AMD"}
+ok, why = bot.passes_filters(bot.parse_filing(CEO_BIG))
+check("watchlist blocks tickers outside it", not ok, why)
+bot.ONLY_TICKERS = {"ACME"}
+check("watchlist lets its own tickers through",
+      bot.passes_filters(bot.parse_filing(CEO_BIG))[0])
+bot.ONLY_TICKERS = set()
+
+bot.EXCLUDE_TICKERS = {"ACME"}
+ok, why = bot.passes_filters(bot.parse_filing(CEO_BIG))
+check("exclusion list blocks a ticker", not ok, why)
+bot.EXCLUDE_TICKERS = set()
+
+# pct_increase now comes from the parser, because the filters need it
+check("pct_increase computed during parsing",
+      bot.parse_filing(DIRECTOR_SMALL)["pct_increase"] == 20.0,
+      str(bot.parse_filing(DIRECTOR_SMALL)["pct_increase"]))
+check("pct_increase derived from post_qty",
+      bot.parse_filing(TINY)["pct_increase"] == 11.1,   # 10 shares on top of 90
+      str(bot.parse_filing(TINY)["pct_increase"]))
+
+FIRST_BUY = filing(
+    "0001234567-26-000012", "NEWB", "New Buyer Co", "999012",
+    "912", "First Timer", {"isDirector": True},
+    [row(5_000, 20.0, 5_000)],  # post == qty, so there was no prior position
+)
+check("pct_increase is None on a first purchase",
+      bot.parse_filing(FIRST_BUY)["pct_increase"] is None)
+check("first purchase is not blocked by MIN_POSITION_INCREASE",
+      bot.passes_filters(bot.parse_filing(FIRST_BUY))[0])
+
+
+# ── 2c. Market-cap filters ────────────────────────────────────────
+print("\n[2c] Market-cap filters")
+
+big = dict(bot.parse_filing(CEO_BIG), market={"market_cap": 3e12, "price": 200,
+                                              "low_52w": 150, "high_52w": 260})
+small = dict(bot.parse_filing(CEO_BIG), market={"market_cap": 80e6, "price": 5,
+                                                "low_52w": 4.8, "high_52w": 12})
+nodata = dict(bot.parse_filing(CEO_BIG), market=None)
+
+bot.MAX_MARKET_CAP = 2e9
+ok, why = bot.passes_market_filters(big)
+check("mega cap blocked by MAX_MARKET_CAP", not ok, why)
+check("small cap passes", bot.passes_market_filters(small)[0])
+bot.MAX_MARKET_CAP = 0
+
+bot.MIN_MARKET_CAP = 300e6
+ok, why = bot.passes_market_filters(small)
+check("micro cap blocked by MIN_MARKET_CAP", not ok, why)
+bot.MIN_MARKET_CAP = 0
+
+check("missing market data never drops a filing",
+      bot.passes_market_filters(nodata)[0])
+
+
 # ── 3. HTML escaping ──────────────────────────────────────────────
 print("\n[3] HTML escaping (the bug that silently killed v1.0 alerts)")
 
-msg = bot.build_message(p, 6, ["+3 CEO/CFO", "+3 value >= $500k"])
+msg = bot.build_message(p, 14, ["+4 CEO/CFO", "+3 value >= $500k"])
 text = msg["text"]
 check("& escaped", "&amp;" in text)
 check("< escaped", "&lt;Holdings&gt;" in text)
@@ -217,6 +320,71 @@ bot.SCORE_PENALTY_10B5 = 0
 tmp_conn.close()
 
 
+# ── 3d. Market-data scoring and cache ─────────────────────────────
+print("\n[3d] Market-data scoring and cache")
+
+mc = bot.init_db(os.path.join(tempfile.mkdtemp(), "m.db"))
+
+base = bot.parse_filing(CEO_BIG)          # $790k purchase
+no_market = dict(base, market=None)
+s_none, w_none = bot.calculate_score(no_market, mc)
+
+# $790k against a $50M company = 1.58% of the whole company
+micro = dict(base, market={"market_cap": 50e6, "price": 10,
+                           "low_52w": 9.5, "high_52w": 40})
+s_micro, w_micro = bot.calculate_score(micro, mc)
+check("large stake in a micro cap scores higher", s_micro > s_none,
+      f"{s_none} -> {s_micro}")
+check("percent of market cap in the breakdown",
+      any("market cap" in x for x in w_micro), str(w_micro))
+check("pct_of_market_cap recorded",
+      abs(micro["pct_of_market_cap"] - 1.58) < 0.01, str(micro.get("pct_of_market_cap")))
+
+# Same purchase against a $3T company = noise
+mega = dict(base, market={"market_cap": 3e12, "price": 200,
+                          "low_52w": 100, "high_52w": 260})
+s_mega, w_mega = bot.calculate_score(mega, mc)
+check("same purchase in a mega cap scores no size points",
+      not any("market cap" in x for x in w_mega), str(w_mega))
+check("micro cap outscores mega cap", s_micro > s_mega, f"{s_micro} vs {s_mega}")
+
+# Buying near the 52-week low
+at_low = dict(base, market={"market_cap": 1e9, "price": 10.4,
+                            "low_52w": 10.0, "high_52w": 30})
+s_low, w_low = bot.calculate_score(at_low, mc)
+check("buying near the 52w low scores",
+      any("52w low" in x for x in w_low), str(w_low))
+check("pct_above_52w_low recorded",
+      abs(at_low["pct_above_52w_low"] - 4.0) < 0.1, str(at_low.get("pct_above_52w_low")))
+
+at_high = dict(base, market={"market_cap": 1e9, "price": 29.0,
+                             "low_52w": 10.0, "high_52w": 30})
+_, w_high = bot.calculate_score(at_high, mc)
+check("buying near the highs scores nothing there",
+      not any("52w low" in x for x in w_high), str(w_high))
+
+# Cache behaviour
+bot.ENABLE_MARKET_DATA = True
+calls = {"n": 0}
+bot._fetch_market_data = lambda t: (calls.__setitem__("n", calls["n"] + 1) or
+                                    {"market_cap": 1e9, "price": 10.0,
+                                     "low_52w": 8.0, "high_52w": 15.0, "cached": False})
+first = bot.get_market_data(mc, "TEST")
+second = bot.get_market_data(mc, "TEST")
+check("market data fetched once", calls["n"] == 1, f"got {calls['n']} calls")
+check("second read comes from cache", second.get("cached") is True)
+check("cached values match", second["market_cap"] == first["market_cap"])
+
+bot._fetch_market_data = lambda t: None
+check("failed lookup returns None", bot.get_market_data(mc, "NOPE") is None)
+
+bot.ENABLE_MARKET_DATA = False
+check("disabled market data returns None", bot.get_market_data(mc, "TEST") is None)
+bot.ENABLE_MARKET_DATA = True
+
+mc.close()
+
+
 # ── 4. Scoring and cluster detection ──────────────────────────────
 print("\n[4] Scoring and cluster detection")
 
@@ -238,15 +406,16 @@ bot.datetime = FakeDT
 
 ceo = bot.parse_filing(CEO_BIG)
 score1, why1 = bot.calculate_score(ceo, conn)
-check("CEO + $790k, no cluster = 6", score1 == 6, f"got {score1}: {why1}")
+# +4 CEO/CFO, +3 value >= $500k, +1 direct = 8
+check("CEO + $790k direct, no cluster = 8", score1 == 8, f"got {score1}: {why1}")
 check("no cluster on the first purchase", ceo["cluster"] == 0)
 bot.record_transaction(conn, ceo, score1, alerted=True)
 
 director = bot.parse_filing(DIRECTOR_SMALL)
 score2, why2 = bot.calculate_score(director, conn)
 check("second insider detects the cluster", director["cluster"] == 1, f"got {director['cluster']}")
-# 1000 shares on top of 5000 prior = exactly +20% -> +2 (inclusive boundary)
-check("director(+1) + position +20%(+2) + cluster(+3) = 6", score2 == 6, f"got {score2}: {why2}")
+# +2 director, +1 position +20% (inclusive boundary), +2 cluster, +1 direct = 6
+check("director + position + cluster + direct = 6", score2 == 6, f"got {score2}: {why2}")
 check("$52k earns no value points", "value" not in " ".join(why2), str(why2))
 bot.record_transaction(conn, director, score2, alerted=True)
 

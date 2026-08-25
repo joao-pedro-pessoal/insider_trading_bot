@@ -22,7 +22,7 @@ Telegram alerts for open-market insider purchases (SEC Form 4, code `P`). Runs o
 | 10 | `while True` on Colab — dies when the runtime disconnects | One cycle per invocation, with an optional `--loop` |
 | 11 | Credentials hardcoded in the file | Everything via environment variables |
 
-Added since: adaptive lookback, cycle status messages, forum-topic routing, exponential backoff, Telegram flood-limit handling, a score breakdown on every alert (`+3 CEO/CFO, +3 value >= $500k`), `acquiredDisposedCode` filtering, `--dry-run`, `--test-telegram`, and 74 fixture tests.
+Added since: adaptive lookback, cycle status messages, forum-topic routing, exponential backoff, Telegram flood-limit handling, a score breakdown on every alert (`+3 CEO/CFO, +3 value >= $500k`), `acquiredDisposedCode` filtering, `--dry-run`, `--test-telegram`, and 106 fixture tests.
 
 ---
 
@@ -141,10 +141,18 @@ Everything is optional except the three credentials.
 | Variable | Default | What it does |
 |---|---|---|
 | `MIN_TRANSACTION_VALUE_USD` | `25000` | ignore purchases below this value |
+| `MIN_PRICE` | `1.0` | ignore stocks below this share price |
+| `EXCLUDE_10B5` | `false` | drop 10b5-1 plan purchases entirely |
+| `REQUIRE_DIRECT` | `false` | personal holdings only |
+| `MIN_POSITION_INCREASE` | `0` | minimum stake increase, in percent |
+| `MIN_MARKET_CAP` / `MAX_MARKET_CAP` | `0` | market-cap bounds in USD (0 = off) |
+| `ONLY_TICKERS` / `EXCLUDE_TICKERS` | — | comma-separated ticker lists |
+| `ENABLE_MARKET_DATA` | `true` | yfinance lookups for cap and 52-week range |
+| `MARKET_CACHE_HOURS` | `168` | how long to trust a cached market cap |
 | `CLUSTER_WINDOW_DAYS` | `7` | window for cluster-buy detection |
-| `SCORE_MIN_TO_SEND` | `1` | below this, log only (no message) |
-| `SCORE_SILENT_BELOW` | `3` | send without a notification |
-| `SCORE_MAX_ALERT_FROM` | `6` | 🚨 MAX ALERT threshold |
+| `SCORE_MIN_TO_SEND` | `9` | below this, log only (no message) |
+| `SCORE_SILENT_BELOW` | `10` | send without a notification |
+| `SCORE_MAX_ALERT_FROM` | `13` | 🚨 MAX ALERT threshold |
 | `SCORE_PENALTY_10B5` | `0` | points to subtract from 10b5-1 plan purchases |
 | `LOOKBACK_MINUTES` | `90` | cold-start window |
 | `LOOKBACK_BUFFER_MINUTES` | `25` | margin for cron delays |
@@ -157,19 +165,56 @@ Everything is optional except the three credentials.
 | `FINVIZ_INSIDER_URL` | `finviz.com/insidertrading?tc=7` | target of the "latest buys" button |
 | `VERBOSE` | `false` | DEBUG logging |
 
+## Filters
+
+Two stages. Cheap filters run first; the market-data lookup only happens for filings that survive them.
+
+### Stage 1 — no network
+
+| Filter | Default | Drops |
+|---|---|---|
+| `MIN_TRANSACTION_VALUE_USD` | `25000` | small purchases |
+| `MIN_PRICE` | `1.0` | penny stocks — the single largest source of Form 4 noise |
+| `EXCLUDE_10B5` | `false` | scheduled plan purchases, entirely |
+| `REQUIRE_DIRECT` | `false` | holdings via trust, LLC or spouse |
+| `MIN_POSITION_INCREASE` | `0` | token top-ups (first purchases are never blocked) |
+| `ONLY_TICKERS` | — | anything off your watchlist |
+| `EXCLUDE_TICKERS` | — | tickers you never want to see |
+
+### Stage 2 — needs market data
+
+| Filter | Default | Drops |
+|---|---|---|
+| `MIN_MARKET_CAP` | `0` (off) | shells and nano caps |
+| `MAX_MARKET_CAP` | `0` (off) | mega caps, where insider buys are noise |
+
+When a market-data lookup fails, these are **skipped** rather than applied. A network hiccup must never silently drop a good filing.
+
 ## Scoring
+
+Maximum around 22. Alerts fire at `SCORE_MIN_TO_SEND` (default **9**).
 
 | Criterion | Points |
 |---|---|
-| CEO / CFO | +3 |
-| Director / VP / other officer | +1 |
-| Value ≥ $500k | +3 |
-| Value ≥ $100k | +1 |
-| Position increase ≥ 20% | +2 |
-| Cluster: another insider bought within 7d | +3 |
+| CEO / CFO | +4 |
+| Other C-suite / President | +3 |
+| Officer / VP | +2 |
+| Director (when not already CEO/CFO) | +2 |
+| 10% owner | +2 |
+| Dual role (executive **and** board member) | +1 |
+| Value ≥ $1M / $500k / $250k / $100k | +4 / +3 / +2 / +1 |
+| Position increase ≥ 100% / 50% / 20% | +3 / +2 / +1 |
+| Cluster: 3+ / 2 / 1 other insiders within 7d | +4 / +3 / +2 |
+| Purchase ≥ 1% / 0.25% / 0.05% of market cap | +3 / +2 / +1 |
+| Price within 10% / 25% of the 52-week low | +2 / +1 |
+| Direct ownership (personal money) | +1 |
 | 10b5-1 plan purchase | `-SCORE_PENALTY_10B5` (default 0) |
 
 Every alert carries its breakdown so you can audit why it fired.
+
+**The percent-of-market-cap row is the one that matters most.** It is what stops a $100k purchase at Apple from ranking alongside a $100k purchase at a $50M company. Everything else is a variation on "who" and "how much".
+
+**A wider scale is not a validated scale.** Adding components makes the number look more considered while leaving it exactly as untested as the six-point version was. Phase 3 is what would change that.
 
 ### Buttons on each alert
 
@@ -187,7 +232,7 @@ Every alert carries its breakdown so you can audit why it fired.
 
 ```bash
 pip install -r requirements.txt
-python test_bot.py                       # 74 tests, no network
+python test_bot.py                       # 106 tests, no network
 
 export SEC_API_KEY="..."
 python insider_bot.py --dry-run          # live data, prints instead of sending
