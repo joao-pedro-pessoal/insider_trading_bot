@@ -376,6 +376,22 @@ def days_in_window(lookback_minutes: int) -> list[date]:
 #  EDGAR INGESTION
 # ══════════════════════════════════════════════════════════════════
 
+def _describe_user_agent() -> str:
+    """
+    Describe EDGAR_USER_AGENT without printing it. Actions masks secret values
+    in logs, so the value itself would appear as *** and tell us nothing --
+    but its shape is enough to spot a wrong paste (a topic ID, an empty
+    string, a bare email with no name).
+    """
+    ua = EDGAR_USER_AGENT
+    if not ua:
+        return "EMPTY - the secret is missing or not passed by the workflow"
+    return (f"length={len(ua)} words={len(ua.split())} "
+            f"has_at={'@' in ua} has_dot={'.' in ua} "
+            f"digits_only={ua.isdigit()} "
+            f"starts_with={'letter' if ua[:1].isalpha() else 'non-letter'}")
+
+
 def _edgar_get(url: str) -> Optional[str]:
     """
     One EDGAR request, rate-limited and retried. Returns None on 404 (a missing
@@ -399,9 +415,18 @@ def _edgar_get(url: str) -> Optional[str]:
             if resp.status_code == 429:
                 raise RateLimitError(f"EDGAR rate limit (429) on {url}")
             if resp.status_code == 403:
+                # The SEC's block page explains which rule was tripped. Log it:
+                # "undeclared automated tool" means the User-Agent, anything
+                # about request rates means the IP is throttled. Guessing
+                # between those two costs far more than printing the body.
+                body = " ".join(resp.text.split())[:400]
+                log.error("EDGAR 403. Response body: %s", body or "(empty)")
+                log.error("User-Agent diagnostics: %s",
+                          _describe_user_agent())
                 raise RuntimeError(
-                    "EDGAR returned 403 - your User-Agent was rejected. "
-                    "EDGAR_USER_AGENT must look like 'Your Name you@email.com'."
+                    "EDGAR returned 403. See the response body logged above: "
+                    "'undeclared automated tool' means EDGAR_USER_AGENT is "
+                    "wrong; a rate message means the IP is being throttled."
                 )
             resp.raise_for_status()
             return resp.text
@@ -1407,7 +1432,9 @@ def test_telegram() -> int:
 def test_edgar() -> int:
     """Fetch today's (or the most recent) index and report what EDGAR returns.
     Answers 'is my User-Agent accepted and is the feed alive' in one run."""
-    log.info("EDGAR_USER_AGENT: %s", EDGAR_USER_AGENT or "(EMPTY)")
+    log.info("EDGAR_USER_AGENT shape: %s", _describe_user_agent())
+    log.info("(the value itself is masked by Actions; the shape above is "
+             "enough to tell a good value from a wrong paste)")
 
     day = datetime.now(NY_TZ).date()
     for _ in range(5):
