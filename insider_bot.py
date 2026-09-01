@@ -141,10 +141,17 @@ MAX_MARKET_CAP        = _env_float("MAX_MARKET_CAP", 0)
 ONLY_TICKERS          = _env_list("ONLY_TICKERS")
 EXCLUDE_TICKERS       = _env_list("EXCLUDE_TICKERS")
 
-# Market data (yfinance) powers market-cap normalisation and 52-week context.
-# Degrades gracefully: if the lookup fails, those points simply are not awarded.
+# Market-cap normalisation. Shares outstanding come from the SEC's own XBRL
+# data (data.sec.gov), multiplied by the transaction price -- which is itself a
+# recent market price. Same infrastructure and same User-Agent as the filings,
+# so if EDGAR works this works.
 ENABLE_MARKET_DATA = _env_bool("ENABLE_MARKET_DATA", True)
 MARKET_CACHE_HOURS = _env_int("MARKET_CACHE_HOURS", 168)  # 7 days
+
+# yfinance adds the 52-week range, which the SEC does not publish. Off by
+# default: Yahoo blocks GitHub Actions IP ranges, so it costs time and returns
+# nothing there. Worth enabling when running from your own machine or a VPS.
+ENABLE_YFINANCE = _env_bool("ENABLE_YFINANCE", False)
 
 # Cold-start lookback, used only when there is no previous run in the database.
 LOOKBACK_MINUTES        = _env_int("LOOKBACK_MINUTES", 90)
@@ -222,8 +229,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
--- Market data cache. Market caps move slowly, and every lookup is a network
--- round trip that can fail, so cache aggressively.
+-- Shares outstanding per issuer, from the SEC's XBRL data. Changes only when
+-- a 10-Q or 10-K is filed, so a week of caching costs nothing in accuracy.
+CREATE TABLE IF NOT EXISTS shares_cache (
+    cik        TEXT PRIMARY KEY,
+    shares     REAL,
+    as_of      TEXT,
+    fetched_at TEXT NOT NULL
+);
+
+-- Optional yfinance data (52-week range), when Yahoo is reachable.
 CREATE TABLE IF NOT EXISTS market_cache (
     ticker      TEXT PRIMARY KEY,
     market_cap  REAL,
@@ -253,6 +268,35 @@ def already_seen(conn: sqlite3.Connection, accession: str) -> bool:
         "SELECT 1 FROM sent_alerts WHERE accession_number = ?", (accession,)
     )
     return cur.fetchone() is not None
+
+
+def duplicate_event(conn: sqlite3.Connection, txn: dict) -> Optional[str]:
+    """
+    Has this exact purchase already been alerted under a different accession?
+
+    Co-filers (fund groups, spouses, trustees) each file their own Form 4 for
+    one economic event, so the same buy arrives two or three times with
+    identical ticker, date, share count and price. Two different insiders
+    independently buying the identical number of shares at the identical price
+    on the identical day is not a thing that happens.
+
+    Returns the accession of the earlier alert, or None.
+    """
+    cur = conn.execute(
+        """
+        SELECT t.accession_number
+        FROM transactions t
+        JOIN sent_alerts s ON s.accession_number = t.accession_number
+        WHERE t.ticker = ? AND t.trade_date = ?
+          AND t.quantity = ? AND ABS(t.price - ?) < 0.005
+          AND t.accession_number != ?
+        LIMIT 1
+        """,
+        (txn["ticker"], txn.get("trade_date"), txn["quantity"],
+         txn["price"], txn["accession_number"]),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def is_processed(conn: sqlite3.Connection, accession: str) -> bool:
@@ -610,7 +654,7 @@ def _parse_xml(xml_text: str, accession: str, filed_at: str) -> Optional[dict]:
     root = ET.fromstring(xml_text)
 
     issuer  = root.find("issuer")
-    ticker  = _xt(issuer, "issuerTradingSymbol").upper().strip()
+    ticker  = _normalise_ticker(_xt(issuer, "issuerTradingSymbol"))
     company = _xt(issuer, "issuerName") or ticker
     cik     = _xt(issuer, "issuerCik").lstrip("0")
 
@@ -692,6 +736,17 @@ def _parse_xml(xml_text: str, accession: str, filed_at: str) -> Optional[dict]:
     }
 
 
+# Placeholders filers use when the issuer has no listed symbol. Without this,
+# "NONE" reads as a perfectly good ticker and produces alerts for companies
+# that cannot be bought.
+TICKER_PLACEHOLDERS = {"NONE", "N/A", "NA", "-", "--", "N.A.", "NOTAPPLICABLE"}
+
+
+def _normalise_ticker(raw: str) -> str:
+    ticker = (raw or "").strip().upper()
+    return "" if ticker in TICKER_PLACEHOLDERS else ticker
+
+
 def _footnotes_mention_10b5(root: ET.Element) -> bool:
     texts = [(f.text or "") for f in root.findall("footnotes/footnote")]
     return "10b5-1" in " ".join(texts).lower()
@@ -734,73 +789,137 @@ def _safe_float(val: Any) -> float:
 #  MARKET DATA
 # ══════════════════════════════════════════════════════════════════
 
-def get_market_data(conn: sqlite3.Connection, ticker: str) -> Optional[dict]:
-    """
-    Market cap and 52-week range for a ticker, cached in SQLite.
+SHARES_CONCEPTS = [
+    ("dei", "EntityCommonStockSharesOutstanding"),   # cover page of every 10-Q/10-K
+    ("us-gaap", "CommonStockSharesOutstanding"),     # fallback
+]
 
-    This is what makes the score aware of scale: a $100k purchase in a
-    nano-cap is enormous, in Apple it is a rounding error.
 
-    Returns None when unavailable. Every caller must handle that -- yfinance is
-    a scraper and will fail sometimes, and a missing market cap must never take
-    the bot down.
+def get_market_data(conn: sqlite3.Connection, txn: dict) -> Optional[dict]:
     """
-    if not ENABLE_MARKET_DATA or not ticker:
+    Market capitalisation for the issuer, so the score can tell a $100k buy in a
+    nano-cap (enormous) from a $100k buy in Apple (a rounding error).
+
+    cap = shares outstanding (SEC XBRL) x transaction price
+
+    Using the insider's own execution price is deliberate: it is a real market
+    price from the day of the trade, it needs no third-party quote feed, and it
+    is the price the ratio should be measured at anyway.
+
+    Returns None when unavailable; every caller must handle that.
+    """
+    if not ENABLE_MARKET_DATA:
         return None
 
+    cik = txn.get("issuer_cik")
+    price = txn.get("price") or 0
+    if not cik or price <= 0:
+        return None
+
+    shares, as_of = get_shares_outstanding(conn, cik)
+    if not shares:
+        return None
+
+    data = {
+        "market_cap": shares * price,
+        "shares_outstanding": shares,
+        "price": price,
+        "shares_as_of": as_of,
+        "source": "sec-xbrl",
+    }
+
+    # Optional extra: the 52-week range, which the SEC does not publish.
+    if ENABLE_YFINANCE:
+        extra = _fetch_yfinance(txn.get("ticker"))
+        if extra:
+            data.update({k: v for k, v in extra.items() if v})
+
+    return data
+
+
+def get_shares_outstanding(conn: sqlite3.Connection,
+                           cik: str) -> tuple[Optional[float], str]:
+    """Shares outstanding for a CIK, cached. Returns (shares, as_of_date)."""
     cur = conn.execute(
-        "SELECT market_cap, price, low_52w, high_52w, fetched_at "
-        "FROM market_cache WHERE ticker = ?", (ticker,)
+        "SELECT shares, as_of, fetched_at FROM shares_cache WHERE cik = ?", (cik,)
     )
     row = cur.fetchone()
     if row:
         try:
             age_h = (datetime.now(timezone.utc)
-                     - datetime.fromisoformat(row[4])).total_seconds() / 3600
+                     - datetime.fromisoformat(row[2])).total_seconds() / 3600
             if age_h < MARKET_CACHE_HOURS:
-                return {"market_cap": row[0], "price": row[1],
-                        "low_52w": row[2], "high_52w": row[3], "cached": True}
+                return row[0], row[1] or ""
         except ValueError:
             pass  # unreadable timestamp, re-fetch
 
-    data = _fetch_market_data(ticker)
-    if data is None:
+    shares, as_of = _fetch_shares_outstanding(cik)
+    if shares:
+        conn.execute(
+            """INSERT OR REPLACE INTO shares_cache (cik, shares, as_of, fetched_at)
+               VALUES (?, ?, ?, ?)""",
+            (cik, shares, as_of, _utc_now_iso()),
+        )
+        conn.commit()
+    return shares, as_of
+
+
+def _fetch_shares_outstanding(cik: str) -> tuple[Optional[float], str]:
+    """
+    Read shares outstanding from the SEC's XBRL company-concept API.
+
+    Companies report this on the cover page of every quarterly and annual
+    report, so it is at most a quarter stale -- fine for sizing a purchase
+    against a company, and far more dependable than a scraped quote.
+    """
+    padded = str(cik).zfill(10)
+
+    for taxonomy, tag in SHARES_CONCEPTS:
+        url = (f"https://data.sec.gov/api/xbrl/companyconcept/"
+               f"CIK{padded}/{taxonomy}/{tag}.json")
+        try:
+            raw = _edgar_get(url)
+        except Exception as exc:
+            log.debug("shares lookup failed for CIK %s: %s", cik, exc)
+            return None, ""
+        if raw is None:
+            continue   # company does not report this concept
+
+        try:
+            units = json.loads(raw).get("units", {}).get("shares", [])
+        except ValueError:
+            continue
+        if not units:
+            continue
+
+        # Most recently filed wins; "end" breaks ties on the same filing date.
+        latest = max(units, key=lambda u: (u.get("filed", ""), u.get("end", "")))
+        value = _safe_float(latest.get("val"))
+        if value > 0:
+            return value, latest.get("end", "")
+
+    log.debug("no shares-outstanding concept for CIK %s", cik)
+    return None, ""
+
+
+def _fetch_yfinance(ticker: Optional[str]) -> Optional[dict]:
+    if not ticker:
         return None
-
-    conn.execute(
-        """INSERT OR REPLACE INTO market_cache
-           (ticker, market_cap, price, low_52w, high_52w, fetched_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (ticker, data["market_cap"], data["price"],
-         data["low_52w"], data["high_52w"], _utc_now_iso()),
-    )
-    conn.commit()
-    return data
-
-
-def _fetch_market_data(ticker: str) -> Optional[dict]:
     try:
         import yfinance as yf
     except ImportError:
-        log.debug("yfinance not installed - market data disabled")
+        log.debug("yfinance not installed")
         return None
 
     try:
         info = yf.Ticker(ticker).fast_info
-        data = {
-            "market_cap": _safe_float(info.get("market_cap")),
-            "price":      _safe_float(info.get("last_price")),
-            "low_52w":    _safe_float(info.get("year_low")),
-            "high_52w":   _safe_float(info.get("year_high")),
-            "cached":     False,
+        return {
+            "low_52w":  _safe_float(info.get("year_low")),
+            "high_52w": _safe_float(info.get("year_high")),
         }
     except Exception as exc:
-        log.debug("market data lookup failed for %s: %s", ticker, exc)
+        log.debug("yfinance lookup failed for %s: %s", ticker, exc)
         return None
-
-    if data["market_cap"] <= 0 and data["price"] <= 0:
-        return None
-    return data
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1093,7 +1212,7 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
         cap_str = f"${cap / 1e9:.2f}B" if cap >= 1e9 else f"${cap / 1e6:.0f}M"
         line = f"\U0001F3F7 Market cap:  <code>{cap_str}</code>"
         if txn.get("pct_of_market_cap"):
-            line += f"  (buy = {txn['pct_of_market_cap']:.2f}%)"
+            line += f"  (buy = {txn['pct_of_market_cap']:.3f}%)"
         lines.append(line)
     if txn.get("pct_above_52w_low") is not None:
         lines.append(f"\U0001F4C9 52w low:     <code>+{txn['pct_above_52w_low']:.0f}%</code> above")
@@ -1311,7 +1430,7 @@ def _run_ingestion(conn: sqlite3.Connection, days: list[date],
         # filing that a free check already rejects.
         passed, reason = passes_filters(txn)
         if passed:
-            txn["market"] = get_market_data(conn, txn["ticker"])
+            txn["market"] = get_market_data(conn, txn)
             passed, reason = passes_market_filters(txn)
 
         score, why = calculate_score(txn, conn)
@@ -1329,6 +1448,13 @@ def _run_ingestion(conn: sqlite3.Connection, days: list[date],
         )
 
         if score < SCORE_MIN_TO_SEND:
+            record_transaction(conn, txn, score, alerted=False)
+            continue
+
+        twin = duplicate_event(conn, txn)
+        if twin:
+            log.info("  skipped: same purchase already alerted as %s "
+                     "(co-filer)", twin)
             record_transaction(conn, txn, score, alerted=False)
             continue
 
@@ -1485,11 +1611,13 @@ def log_destination() -> None:
     log.info("Source: SEC EDGAR as '%s'", EDGAR_USER_AGENT or "(EMPTY)")
     log.info("Alert threshold: score >= %d | min value: $%s | min price: $%.2f",
              SCORE_MIN_TO_SEND, f"{MIN_TRANSACTION_VALUE_USD:,}", MIN_PRICE)
-    log.info("10b5-1 penalty: -%d%s | market data: %s | cap: %d filings/run",
+    log.info("10b5-1 penalty: -%d%s | cap: %d filings/run",
              SCORE_PENALTY_10B5,
              " (excluded entirely)" if EXCLUDE_10B5 else "",
-             "on" if ENABLE_MARKET_DATA else "off",
              MAX_FILINGS_PER_RUN)
+    log.info("Market cap: %s | 52-week range: %s",
+             "SEC XBRL shares x trade price" if ENABLE_MARKET_DATA else "off",
+             "yfinance" if ENABLE_YFINANCE else "off")
 
     extra = []
     if REQUIRE_DIRECT:

@@ -7,6 +7,7 @@ EDGAR nor Telegram.
 """
 
 import datetime as _dt
+import json
 import os
 import sys
 import tempfile
@@ -168,6 +169,15 @@ combo = parse(form4("MIX", "Mixed Co", "9", "9", "Mixed Owner",
                      txn_xml(500, 12.0, 5_000, code="S", ad="D")],
                     officer_title="CFO", director=True, ten_pct=True))
 check("only the purchase row counts in a mixed filing", combo["quantity"] == 1_000)
+
+# Filers write "NONE" when the issuer has no listed symbol. That must not read
+# as a tradeable ticker.
+for placeholder in ("NONE", "N/A", "none", " - "):
+    got = parse(form4(placeholder, "Unlisted Co", "9", "9", "Owner",
+                      [txn_xml(10_000, 10.0, 50_000)], ten_pct=True))
+    check(f"ticker placeholder {placeholder!r} treated as missing",
+          got["ticker"] == "" and not bot.passes_filters(got)[0], got["ticker"])
+check("a real ticker survives normalisation", parse(CEO_BIG)["ticker"] == "ACME")
 check("all three roles in the title",
       combo["title"] == "CFO, Director, 10% Owner", combo["title"])
 
@@ -275,6 +285,41 @@ check("amendments included when enabled", len(bot.parse_daily_index(INDEX)) == 3
 bot.INCLUDE_AMENDMENTS = False
 
 check("empty index yields nothing", bot.parse_daily_index("") == [])
+
+
+# A daily index that has not been published yet comes back as an S3
+# AccessDenied, not a 404. Treating that as fatal broke every early-morning run.
+class FakeResp:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+    def raise_for_status(self):
+        pass
+
+
+import insider_bot as _b  # noqa: E402
+_real_get = _b.requests.get
+
+S3_MISSING = ('<?xml version="1.0" encoding="UTF-8"?><Error>'
+              '<Code>AccessDenied</Code><Message>Access Denied</Message></Error>')
+SEC_BLOCK = ("<html><body>Your Request Originates from an Undeclared "
+             "Automated Tool</body></html>")
+
+_b.requests.get = lambda *a, **k: FakeResp(403, S3_MISSING)
+check("unpublished index (S3 AccessDenied) is not an error",
+      _b._edgar_get("https://example/x.idx") is None)
+
+_b.requests.get = lambda *a, **k: FakeResp(403, SEC_BLOCK)
+try:
+    _b._edgar_get("https://example/x.idx")
+    check("a real 403 block still raises", False, "no exception raised")
+except RuntimeError as exc:
+    check("a real 403 block still raises", "403" in str(exc))
+
+_b.requests.get = lambda *a, **k: FakeResp(404, "")
+check("404 also returns None", _b._edgar_get("https://example/x.idx") is None)
+
+_b.requests.get = _real_get
 check("header-only index yields nothing",
       bot.parse_daily_index("Form Type  Company\n-----\n") == [])
 
@@ -492,25 +537,84 @@ check("buying near the highs scores nothing there",
 
 bot.datetime = _real
 
-# Market-data cache
+# Market cap from SEC XBRL shares x trade price
 bot.ENABLE_MARKET_DATA = True
+bot.ENABLE_YFINANCE = False
+_real_shares_fetch = bot._fetch_shares_outstanding   # restored further down
 calls = {"n": 0}
-bot._fetch_market_data = lambda t: (calls.__setitem__("n", calls["n"] + 1) or
-                                    {"market_cap": 1e9, "price": 10.0,
-                                     "low_52w": 8.0, "high_52w": 15.0, "cached": False})
-first = bot.get_market_data(conn, "TEST")
-second = bot.get_market_data(conn, "TEST")
-check("market data fetched once", calls["n"] == 1, f"got {calls['n']} calls")
-check("second read comes from cache", second.get("cached") is True)
-bot._fetch_market_data = lambda t: None
-check("failed lookup returns None", bot.get_market_data(conn, "NOPE") is None)
+bot._fetch_shares_outstanding = lambda cik: (
+    calls.__setitem__("n", calls["n"] + 1) or (20_000_000.0, "2026-06-30"))
+
+md = bot.get_market_data(conn, ceo)          # 15,000 shares at ~$52.67
+check("market cap = shares x trade price",
+      abs(md["market_cap"] - 20_000_000 * ceo["price"]) < 1, str(md["market_cap"]))
+check("shares outstanding carried through", md["shares_outstanding"] == 20_000_000)
+check("source labelled", md["source"] == "sec-xbrl")
+check("as-of date kept", md["shares_as_of"] == "2026-06-30")
+
+bot.get_market_data(conn, ceo)
+check("shares fetched once, then cached", calls["n"] == 1, f"got {calls['n']} calls")
+
+bot._fetch_shares_outstanding = lambda cik: (None, "")
+no_cik = dict(ceo, issuer_cik="999999")
+check("missing shares data returns None", bot.get_market_data(conn, no_cik) is None)
+check("no CIK returns None", bot.get_market_data(conn, dict(ceo, issuer_cik="")) is None)
+check("zero price returns None", bot.get_market_data(conn, dict(ceo, price=0)) is None)
+
 bot.ENABLE_MARKET_DATA = False
-check("disabled market data returns None", bot.get_market_data(conn, "TEST2") is None)
+check("disabled market data returns None", bot.get_market_data(conn, ceo) is None)
 bot.ENABLE_MARKET_DATA = True
+
+# The XBRL parser picks the most recently filed value
+bot._fetch_shares_outstanding = _real_shares_fetch
+CONCEPT = json.dumps({"units": {"shares": [
+    {"end": "2025-12-31", "val": 18_000_000, "filed": "2026-02-20"},
+    {"end": "2026-06-30", "val": 20_500_000, "filed": "2026-08-05"},
+    {"end": "2026-03-31", "val": 19_000_000, "filed": "2026-05-06"},
+]}})
+bot._edgar_get = lambda u: CONCEPT
+shares, as_of = bot._fetch_shares_outstanding("999001")
+check("latest filed value wins", shares == 20_500_000, str(shares))
+check("as-of is the period end", as_of == "2026-06-30", as_of)
+
+bot._edgar_get = lambda u: json.dumps({"units": {"shares": []}})
+check("empty concept returns nothing", bot._fetch_shares_outstanding("1")[0] is None)
+bot._edgar_get = lambda u: "not json"
+check("malformed concept returns nothing", bot._fetch_shares_outstanding("1")[0] is None)
+bot._edgar_get = lambda u: None
+check("missing concept returns nothing", bot._fetch_shares_outstanding("1")[0] is None)
 
 check("already_seen catches a duplicate",
       bot.record_alert(conn, ceo, score1) or bot.already_seen(conn, ceo["accession_number"]))
 check("already_seen ignores a new one", not bot.already_seen(conn, "0000-00-000000"))
+
+# Co-filers: the same economic event arriving under a second accession
+co_filer = parse(form4("ACME", "Acme", "999001", "333", "Co Filer",
+                       [txn_xml(10_000, 52.50, 110_000),
+                        txn_xml(5_000, 53.00, 115_000)],
+                       officer_title="Chief Executive Officer"),
+                 accession="0009999999-26-000001")
+check("identical purchase under another accession is caught",
+      bot.duplicate_event(conn, co_filer) == ceo["accession_number"],
+      str(bot.duplicate_event(conn, co_filer)))
+
+different = parse(form4("ACME", "Acme", "999001", "444", "Other Buyer",
+                        [txn_xml(9_000, 52.50, 110_000)],
+                        officer_title="CFO"),
+                  accession="0009999999-26-000002")
+check("a different share count is not a duplicate",
+      bot.duplicate_event(conn, different) is None)
+
+other_ticker = parse(form4("ZZZZ", "Other Co", "888", "333", "Someone",
+                           [txn_xml(10_000, 52.50, 110_000),
+                            txn_xml(5_000, 53.00, 115_000)],
+                           officer_title="CEO"),
+                     accession="0009999999-26-000003")
+check("the same numbers on another ticker are not a duplicate",
+      bot.duplicate_event(conn, other_ticker) is None)
+
+check("a transaction never alerted is not a duplicate source",
+      bot.duplicate_event(conn, parse(TINY, accession="0009999999-26-000004")) is None)
 conn.close()
 
 
