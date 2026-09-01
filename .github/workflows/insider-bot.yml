@@ -127,9 +127,13 @@ jobs:
             exit $?
           fi
 
+          # A dry run writes to a throwaway database. Otherwise it would mark
+          # filings as processed and alerts as sent, and those alerts would
+          # never reach Telegram when you go live. A test must not consume
+          # the real backlog.
           ARGS="--db state/alerts.db"
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            ARGS="$ARGS --dry-run"
+            ARGS="--db /tmp/dry-run.db --dry-run"
           fi
           if [ -n "${{ github.event.inputs.lookback }}" ]; then
             ARGS="$ARGS --lookback ${{ github.event.inputs.lookback }}"
