@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 """
-SEC INSIDER TRADING ALERT BOT v1.2
+SEC INSIDER TRADING ALERT BOT v2.0
 ==================================
 
 Telegram alerts for open-market insider purchases (SEC Form 4, code P).
 
+Data comes straight from SEC EDGAR: free, no API key, no quota. v1.x used
+sec-api.io, whose free tier is 100 lifetime calls -- the bot exhausted it in
+days. EDGAR is the primary source that such services resell.
+
 Designed to run one cycle per invocation on a cron (GitHub Actions), with an
 optional --loop mode for a long-running VPS process.
 
-Key design decisions worth knowing before you change anything:
+How ingestion works, and why:
 
-  * Time filtering happens locally, not in the API query. The API returns
-    filedAt in New York time with an explicit offset; comparing that against
-    a UTC-derived cutoff string was the single worst bug in v1.0. We paginate
-    by filedAt descending and stop at the cutoff, comparing timezone-aware
-    datetimes in Python -- the only place that comparison is reliable.
+  * EDGAR publishes a daily index of every filing. We read the index for each
+    day in the window, keep the Form 4 entries, and skip any accession number
+    already in `processed_filings`. Only genuinely new filings are downloaded.
 
-  * The lookback window is derived from the last successful run, stored in the
-    database. A fixed window loses filings whenever a run fails, is delayed,
-    or when there is a long gap between crons (Friday night to Monday).
+  * That accession-level dedup replaces time-window pagination entirely. The
+    window now only decides *which days* to look at, so there is no cutoff
+    arithmetic to get wrong -- which is where v1.0's worst bug lived.
 
-  * Every parsed filing is recorded, not just the ones that trigger an alert.
-    Cluster detection reads from that table, so filtering before writing would
-    blind it.
+  * Indexes for past days are immutable. Once a day is fully processed it is
+    marked done and never fetched again. Only today's index is re-read.
 
-  * Deduplication is by accession number, which makes generous overlap between
-    runs harmless. Overlap is deliberate.
+  * Work is capped per run (MAX_FILINGS_PER_RUN). A large backlog is chipped
+    away across runs instead of timing out, because progress is recorded as it
+    happens rather than at the end.
+
+  * Every parsed filing is recorded, not just the ones that alert. Cluster
+    detection reads from that table, so filtering before writing would blind it.
+
+EDGAR requires a User-Agent identifying you, and asks for no more than 10
+requests/second. Both are respected below. See:
+https://www.sec.gov/os/accessing-edgar-data
 
 NOT financial advice. The scoring weights are heuristics and have never been
 backtested. See README.md.
@@ -38,11 +47,13 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 import requests
@@ -66,13 +77,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _env_list(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
+    return {t.strip().upper() for t in raw.split(",") if t.strip()}
+
+
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SEC_API_KEY      = os.environ.get("SEC_API_KEY", "")
 
 # Optional: topic ID inside a forum-enabled supergroup. Without it, messages
 # land in the "General" topic instead of the one you picked. Find it in the
@@ -85,76 +107,53 @@ TELEGRAM_TOPIC_ID = os.environ.get("TELEGRAM_TOPIC_ID", "").strip()
 #   "errors"  - only when something fails
 #   "off"     - never
 STATUS_MESSAGES = os.environ.get("STATUS_MESSAGES", "off").strip().lower()
-
-# Separate topic for status messages. Empty = same topic as the alerts.
 STATUS_TOPIC_ID = os.environ.get("STATUS_TOPIC_ID", "").strip()
 
-SEC_API_ENDPOINT = os.environ.get("SEC_API_ENDPOINT", "https://api.sec-api.io/insider-trading")
+# ── EDGAR ─────────────────────────────────────────────────────────
+# The SEC requires a User-Agent that identifies you, with a contact address.
+# Requests without one get blocked. Format: "Your Name your@email.com".
+EDGAR_USER_AGENT   = os.environ.get("EDGAR_USER_AGENT", "").strip()
+EDGAR_BASE         = "https://www.sec.gov"
+# The published ceiling is 10 requests/second. 0.15s leaves headroom.
+EDGAR_DELAY        = _env_float("EDGAR_DELAY", 0.15)
+# Filings downloaded per run. Caps runtime; the backlog carries to the next run.
+MAX_FILINGS_PER_RUN = _env_int("MAX_FILINGS_PER_RUN", 400)
+# Include amended filings (4/A). Off by default: they mostly restate filings
+# already alerted on.
+INCLUDE_AMENDMENTS = _env_bool("INCLUDE_AMENDMENTS", False)
 
 DB_PATH = os.environ.get("DB_PATH", "state/alerts.db")
 
 MIN_TRANSACTION_VALUE_USD = _env_int("MIN_TRANSACTION_VALUE_USD", 25_000)
 CLUSTER_WINDOW_DAYS       = _env_int("CLUSTER_WINDOW_DAYS", 7)
-SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 9)   # below this, log only
-SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 10) # send without notification
+SCORE_MIN_TO_SEND         = _env_int("SCORE_MIN_TO_SEND", 9)
+SCORE_SILENT_BELOW        = _env_int("SCORE_SILENT_BELOW", 10)
 SCORE_MAX_ALERT_FROM      = _env_int("SCORE_MAX_ALERT_FROM", 13)
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def _env_list(name: str) -> set[str]:
-    raw = os.environ.get(name, "")
-    return {t.strip().upper() for t in raw.split(",") if t.strip()}
-
+SCORE_PENALTY_10B5        = _env_int("SCORE_PENALTY_10B5", 0)
 
 # ── Hard filters: applied before scoring, they drop a filing entirely ──
-# Penny stocks are the single largest source of Form 4 noise.
-MIN_PRICE            = _env_float("MIN_PRICE", 1.0)
-# Skip 10b5-1 plan purchases outright (scheduled months ahead, low information).
-EXCLUDE_10B5         = _env_bool("EXCLUDE_10B5", False)
-# Require direct ownership (personal money, not via trust/LLC/partnership).
-REQUIRE_DIRECT       = _env_bool("REQUIRE_DIRECT", False)
-# Minimum position increase, in percent. 0 = off.
+MIN_PRICE             = _env_float("MIN_PRICE", 1.0)
+EXCLUDE_10B5          = _env_bool("EXCLUDE_10B5", False)
+REQUIRE_DIRECT        = _env_bool("REQUIRE_DIRECT", False)
 MIN_POSITION_INCREASE = _env_float("MIN_POSITION_INCREASE", 0.0)
-# Market-cap bounds in USD. 0 = off. Needs ENABLE_MARKET_DATA.
-MIN_MARKET_CAP       = _env_float("MIN_MARKET_CAP", 0)
-MAX_MARKET_CAP       = _env_float("MAX_MARKET_CAP", 0)
-# Ticker allow/deny lists, comma separated. ONLY_TICKERS acts as a watchlist.
-ONLY_TICKERS         = _env_list("ONLY_TICKERS")
-EXCLUDE_TICKERS      = _env_list("EXCLUDE_TICKERS")
+MIN_MARKET_CAP        = _env_float("MIN_MARKET_CAP", 0)
+MAX_MARKET_CAP        = _env_float("MAX_MARKET_CAP", 0)
+ONLY_TICKERS          = _env_list("ONLY_TICKERS")
+EXCLUDE_TICKERS       = _env_list("EXCLUDE_TICKERS")
 
 # Market data (yfinance) powers market-cap normalisation and 52-week context.
 # Degrades gracefully: if the lookup fails, those points simply are not awarded.
-ENABLE_MARKET_DATA   = _env_bool("ENABLE_MARKET_DATA", True)
-MARKET_CACHE_HOURS   = _env_int("MARKET_CACHE_HOURS", 168)  # 7 days
-
-# Penalty for purchases made under a 10b5-1 plan: they were scheduled months in
-# advance, so they say far less about the insider's current view. Default 0 (no
-# penalty) so behaviour does not change without you choosing it -- set to 2 or 3
-# to push automatic plans down the ranking.
-SCORE_PENALTY_10B5        = _env_int("SCORE_PENALTY_10B5", 0)
+ENABLE_MARKET_DATA = _env_bool("ENABLE_MARKET_DATA", True)
+MARKET_CACHE_HOURS = _env_int("MARKET_CACHE_HOURS", 168)  # 7 days
 
 # Cold-start lookback, used only when there is no previous run in the database.
 LOOKBACK_MINUTES        = _env_int("LOOKBACK_MINUTES", 90)
-# Margin added to the gap since the last run, to absorb GitHub cron delays
-# (typically 5-20 minutes).
 LOOKBACK_BUFFER_MINUTES = _env_int("LOOKBACK_BUFFER_MINUTES", 25)
-# Catch-up ceiling. Three days covers a full weekend with room to spare; beyond
-# that the bot has been down for days and flooding the channel helps nobody.
+# Catch-up ceiling. Three days covers a full weekend with room to spare.
 MAX_LOOKBACK_MINUTES    = _env_int("MAX_LOOKBACK_MINUTES", 4320)
 
-PAGE_SIZE         = 50        # SEC-API maximum
-MAX_PAGES         = _env_int("MAX_PAGES", 6)
-# Page ceiling in catch-up mode. Each page is one SEC-API request, so this is
-# also the brake on your API plan consumption.
-MAX_PAGES_CATCHUP = _env_int("MAX_PAGES_CATCHUP", 30)
-HTTP_TIMEOUT      = 25
-MAX_RETRIES       = 3
+HTTP_TIMEOUT = 25
+MAX_RETRIES  = 3
 
 logging.basicConfig(
     level=logging.DEBUG if _env_bool("VERBOSE") else logging.INFO,
@@ -165,7 +164,7 @@ log = logging.getLogger("InsiderBot")
 
 
 class RateLimitError(Exception):
-    """SEC-API returned 429."""
+    """EDGAR returned 429, or blocked us for excessive requests."""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -181,8 +180,9 @@ CREATE TABLE IF NOT EXISTS sent_alerts (
     sent_at          TEXT NOT NULL
 );
 
--- Log of EVERYTHING parsed, including filings that never triggered an alert.
--- Cluster detection reads from here: filtering before writing would blind it.
+-- Log of EVERYTHING parsed as a purchase, including filings that never
+-- triggered an alert. Cluster detection reads from here: filtering before
+-- writing would blind it.
 CREATE TABLE IF NOT EXISTS transactions (
     accession_number TEXT PRIMARY KEY,
     ticker           TEXT NOT NULL,
@@ -203,8 +203,20 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_txn_ticker_date
     ON transactions (ticker, trade_date);
 
--- The bot's own state. Holds the last successful run so the lookback window
--- can be computed instead of hardcoded.
+-- Every Form 4 we have downloaded, purchase or not. This is what stops the
+-- bot re-downloading the same filings on every run, and it is what makes the
+-- daily index approach cheap.
+CREATE TABLE IF NOT EXISTS processed_filings (
+    accession    TEXT PRIMARY KEY,
+    filed_date   TEXT,
+    was_purchase INTEGER DEFAULT 0,
+    processed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_date
+    ON processed_filings (filed_date);
+
+-- The bot's own state: last successful run, and which daily indexes are done.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -241,6 +253,23 @@ def already_seen(conn: sqlite3.Connection, accession: str) -> bool:
         "SELECT 1 FROM sent_alerts WHERE accession_number = ?", (accession,)
     )
     return cur.fetchone() is not None
+
+
+def is_processed(conn: sqlite3.Connection, accession: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM processed_filings WHERE accession = ?", (accession,)
+    )
+    return cur.fetchone() is not None
+
+
+def mark_processed(conn: sqlite3.Connection, accession: str,
+                   filed_date: str, was_purchase: bool) -> None:
+    conn.execute(
+        """INSERT OR REPLACE INTO processed_filings
+           (accession, filed_date, was_purchase, processed_at)
+           VALUES (?, ?, ?, ?)""",
+        (accession, filed_date, int(was_purchase), _utc_now_iso()),
+    )
 
 
 def record_transaction(conn: sqlite3.Connection, txn: dict, score: int, alerted: bool) -> None:
@@ -327,150 +356,241 @@ def compute_lookback(conn: sqlite3.Connection,
     return max(minutes, 15), f"since last run ({gap:.0f}min ago)"
 
 
-def pages_for(lookback_minutes: int) -> int:
-    """Pages to fetch. A wider window needs more pages, otherwise catch-up
-    truncates silently and we are back to losing filings."""
-    needed = max(MAX_PAGES, int(lookback_minutes / 30))
-    return min(needed, MAX_PAGES_CATCHUP)
+def days_in_window(lookback_minutes: int) -> list[date]:
+    """
+    Filing dates the window touches, oldest first, in New York time (EDGAR
+    timestamps filings in ET). Weekends produce no index and are skipped later.
+    """
+    now_ny = datetime.now(NY_TZ)
+    start = now_ny - timedelta(minutes=lookback_minutes)
+    days = []
+    d = start.date()
+    while d <= now_ny.date():
+        if d.weekday() < 5:      # EDGAR does not accept filings at weekends
+            days.append(d)
+        d += timedelta(days=1)
+    return days
 
 
 # ══════════════════════════════════════════════════════════════════
-#  INGESTION
+#  EDGAR INGESTION
 # ══════════════════════════════════════════════════════════════════
 
-# Lucene: Form 4 filings containing at least one open-market purchase (code P).
-# Time filtering is done locally -- see the module docstring.
-BASE_QUERY = 'documentType:"4" AND nonDerivativeTable.transactions.coding.code:P'
-
-
-def _post_with_retry(payload: dict) -> dict:
+def _edgar_get(url: str) -> Optional[str]:
+    """
+    One EDGAR request, rate-limited and retried. Returns None on 404 (a missing
+    daily index for a holiday is normal, not an error).
+    """
+    headers = {
+        "User-Agent": EDGAR_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "www.sec.gov",
+    }
     last_error: Optional[Exception] = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.post(
-                SEC_API_ENDPOINT,
-                json=payload,
-                headers={
-                    "Authorization": SEC_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                timeout=HTTP_TIMEOUT,
-            )
+            time.sleep(EDGAR_DELAY)   # stay under the 10 req/s ceiling
+            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+
+            if resp.status_code == 404:
+                return None
             if resp.status_code == 429:
-                raise RateLimitError("SEC-API rate limit (429)")
-            if resp.status_code in (401, 403):
-                raise RuntimeError(f"SEC-API auth failed ({resp.status_code}) - check SEC_API_KEY")
+                raise RateLimitError(f"EDGAR rate limit (429) on {url}")
+            if resp.status_code == 403:
+                raise RuntimeError(
+                    "EDGAR returned 403 - your User-Agent was rejected. "
+                    "EDGAR_USER_AGENT must look like 'Your Name you@email.com'."
+                )
             resp.raise_for_status()
-            return resp.json()
+            return resp.text
+
         except (RateLimitError, RuntimeError):
             raise
-        except Exception as exc:  # network, timeout, 5xx
+        except Exception as exc:
             last_error = exc
             wait = 2 ** attempt
-            log.warning("SEC-API attempt %d/%d failed (%s) - retrying in %ds",
+            log.warning("EDGAR attempt %d/%d failed (%s) - retrying in %ds",
                         attempt, MAX_RETRIES, exc, wait)
             time.sleep(wait)
-    raise RuntimeError(f"SEC-API unreachable after {MAX_RETRIES} attempts: {last_error}")
+
+    raise RuntimeError(f"EDGAR unreachable after {MAX_RETRIES} attempts: {last_error}")
 
 
-def fetch_recent_purchases(cutoff: datetime, max_pages: int = MAX_PAGES) -> list[dict]:
+def daily_index_url(day: date) -> str:
+    quarter = (day.month - 1) // 3 + 1
+    return (f"{EDGAR_BASE}/Archives/edgar/daily-index/"
+            f"{day.year}/QTR{quarter}/form.{day:%Y%m%d}.idx")
+
+
+def parse_daily_index(text: str) -> list[dict]:
     """
-    Return Form 4 filings containing purchases with filedAt >= cutoff.
+    Pull the Form 4 rows out of a daily index.
 
-    Paginates by filedAt descending and stops as soon as it hits a filing older
-    than the cutoff. No timezone arithmetic in the query -- the comparison uses
-    timezone-aware datetimes in Python, which is the only place it is reliable.
+    The file is fixed-width-ish, but company names contain spaces, so fields
+    are read from the right: the last token is the path, then the filing date,
+    then the CIK.
     """
-    if cutoff.tzinfo is None:
-        raise ValueError("cutoff must be timezone-aware")
+    filings = []
+    wanted = {"4"} if not INCLUDE_AMENDMENTS else {"4", "4/A"}
 
-    collected: list[dict] = []
-    for page in range(max_pages):
-        payload = {
-            "query": BASE_QUERY,
-            "from": str(page * PAGE_SIZE),
-            "size": str(PAGE_SIZE),
-            "sort": [{"filedAt": {"order": "desc"}}],
-        }
-        data = _post_with_retry(payload)
-        batch = data.get("transactions", [])
-        if not batch:
-            break
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith("-"):
+            continue
 
-        stop = False
-        for filing in batch:
-            filed_at = _parse_dt(filing.get("filedAt"))
-            if filed_at is None:
-                collected.append(filing)  # no date: let it through, dedup protects us
-                continue
-            if filed_at < cutoff:
-                stop = True
-                break
-            collected.append(filing)
+        head = line.split(None, 1)
+        if not head or head[0] not in wanted:
+            continue
 
-        log.debug("page %d: %d filings, %d collected", page, len(batch), len(collected))
-        if stop or len(batch) < PAGE_SIZE:
-            break
-    else:
-        log.warning("Hit the page ceiling (%d) - filings may be missing. "
-                    "Raise MAX_PAGES_CATCHUP or shorten the window.", max_pages)
+        parts = line.rsplit(None, 3)
+        if len(parts) < 4:
+            continue
+        _, cik, filed_date, path = parts
 
-    return collected
+        if not path.endswith(".txt") or "/" not in path:
+            continue
+
+        # edgar/data/1930183/0001930183-26-000123.txt
+        accession = path.rsplit("/", 1)[-1].removesuffix(".txt")
+        filings.append({
+            "accession": accession,
+            "cik": cik.strip(),
+            "filed_date": filed_date.strip(),
+            "url": f"{EDGAR_BASE}/Archives/{path}",
+        })
+
+    return filings
 
 
-def _parse_dt(value: Any) -> Optional[datetime]:
-    """Parse SEC-API ISO 8601 ('2022-08-09T21:23:00-04:00') into an aware datetime."""
-    if not value or not isinstance(value, str):
+def iter_new_filings(conn: sqlite3.Connection,
+                     days: list[date]) -> Iterator[dict]:
+    """
+    Yield Form 4 filings from the given days that have not been processed yet.
+
+    Indexes for past days are immutable, so once a day is fully processed it is
+    marked done in `meta` and never fetched again. Only today's index is re-read
+    on every run.
+    """
+    today = datetime.now(NY_TZ).date()
+
+    for day in days:
+        key = f"index_done_{day:%Y-%m-%d}"
+        if day < today and get_meta(conn, key) == "1":
+            log.debug("index %s already complete - skipping", day)
+            continue
+
+        text = _edgar_get(daily_index_url(day))
+        if text is None:
+            log.debug("no index for %s (holiday?)", day)
+            if day < today:
+                set_meta(conn, key, "1")
+            continue
+
+        entries = parse_daily_index(text)
+        new = [e for e in entries if not is_processed(conn, e["accession"])]
+        log.info("index %s: %d Form 4 filings, %d new", day, len(entries), len(new))
+
+        for entry in new:
+            entry["day"] = day
+            entry["day_key"] = key
+            entry["day_total"] = len(new)
+            yield entry
+
+
+ACCEPTANCE_RE = re.compile(r"<ACCEPTANCE-DATETIME>\s*(\d{14})")
+
+
+def fetch_and_parse(entry: dict) -> Optional[dict]:
+    """
+    Download one Form 4 submission and turn it into a normalised transaction.
+
+    The `.txt` is the complete submission with the ownership XML embedded, so
+    this is one request per filing rather than a directory listing plus a
+    document fetch.
+    """
+    raw = _edgar_get(entry["url"])
+    if raw is None:
         return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+
+    match = re.search(r"<ownershipDocument>.*?</ownershipDocument>", raw, re.DOTALL)
+    if not match:
+        log.debug("no ownershipDocument in %s", entry["accession"])
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY_TZ)  # the SEC reports in New York time
-    return dt
+
+    filed_at = entry["filed_date"]
+    stamp = ACCEPTANCE_RE.search(raw)
+    if stamp:
+        # 20260901183045 -> 2026-09-01T18:30, in New York time
+        s = stamp.group(1)
+        filed_at = f"{s[0:4]}-{s[4:6]}-{s[6:8]}T{s[8:10]}:{s[10:12]}"
+
+    return parse_form4_xml(match.group(0), entry["accession"], filed_at)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PARSING
+#  FORM 4 XML PARSING
 # ══════════════════════════════════════════════════════════════════
 
-def parse_filing(raw: dict) -> Optional[dict]:
+def _xt(node: Optional[ET.Element], path: str, default: str = "") -> str:
     """
-    Normalise a SEC-API filing into a single aggregated transaction.
+    Text at `path`, unwrapping the <value> element that Form 4 uses for most
+    fields (it exists so footnotes can be attached alongside).
+    """
+    if node is None:
+        return default
+    found = node.find(path)
+    if found is None:
+        return default
+    value = found.find("value")
+    target = value if value is not None else found
+    return (target.text or "").strip() if target.text else default
 
-    Aggregates EVERY row coded P with acquiredDisposedCode A from the same
-    filing: an insider buying in three tranches was being undervalued when only
-    the first row was read.
+
+def _xbool(node: Optional[ET.Element], path: str) -> bool:
+    raw = _xt(node, path).strip().lower()
+    return raw in {"1", "true"}
+
+
+def parse_form4_xml(xml_text: str, accession: str,
+                    filed_at: str) -> Optional[dict]:
+    """
+    Normalise a Form 4 ownership document into a single aggregated purchase.
+
+    Aggregates EVERY non-derivative row coded P with an "A" (acquired) flag:
+    an insider buying in three tranches would otherwise be undervalued.
+
+    Returns None when the filing contains no open-market purchase, which is the
+    common case -- most Form 4s are grants, option exercises and sales.
     """
     try:
-        return _parse(raw)
+        return _parse_xml(xml_text, accession, filed_at)
     except Exception as exc:
-        log.debug("parse failed (%s): %s", exc, str(raw)[:160])
+        log.debug("parse failed for %s (%s)", accession, exc)
         return None
 
 
-def _parse(raw: dict) -> Optional[dict]:
-    accession = raw.get("accessionNo") or raw.get("id")
-    if not accession:
-        return None
+def _parse_xml(xml_text: str, accession: str, filed_at: str) -> Optional[dict]:
+    root = ET.fromstring(xml_text)
 
-    issuer  = raw.get("issuer") or {}
-    ticker  = (issuer.get("tradingSymbol") or "").strip().upper()
-    company = issuer.get("name") or ticker
-    cik     = str(issuer.get("cik") or "").strip()
+    issuer  = root.find("issuer")
+    ticker  = _xt(issuer, "issuerTradingSymbol").upper().strip()
+    company = _xt(issuer, "issuerName") or ticker
+    cik     = _xt(issuer, "issuerCik").lstrip("0")
 
-    owner        = raw.get("reportingOwner") or {}
-    insider_name = owner.get("name") or "Unknown"
-    insider_cik  = str(owner.get("cik") or "").strip()
-    title        = _extract_title(owner.get("relationship") or {})
+    owner = root.find("reportingOwner")
+    insider_name = _xt(owner, "reportingOwnerId/rptOwnerName") or "Unknown"
+    insider_cik  = _xt(owner, "reportingOwnerId/rptOwnerCik").lstrip("0")
+    relationship = owner.find("reportingOwnerRelationship") if owner is not None else None
+    title = _extract_title(relationship)
 
-    rows = ((raw.get("nonDerivativeTable") or {}).get("transactions")) or []
-    purchases = [
-        r for r in rows
-        if ((r.get("coding") or {}).get("code") == "P")
-        and ((r.get("amounts") or {}).get("acquiredDisposedCode", "A") == "A")
-    ]
+    purchases = []
+    for txn in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        code = _xt(txn, "transactionCoding/transactionCode")
+        acq  = _xt(txn, "transactionAmounts/transactionAcquiredDisposedCode")
+        if code == "P" and acq in ("A", ""):
+            purchases.append(txn)
+
     if not purchases:
         return None
 
@@ -480,22 +600,23 @@ def _parse(raw: dict) -> Optional[dict]:
     trade_dates: list[str] = []
     is_direct    = False
 
-    for row in purchases:
-        amounts = row.get("amounts") or {}
-        shares  = _safe_float(amounts.get("shares"))
-        price   = _safe_float(amounts.get("pricePerShare"))
+    for txn in purchases:
+        shares = _safe_float(_xt(txn, "transactionAmounts/transactionShares"))
+        price  = _safe_float(_xt(txn, "transactionAmounts/transactionPricePerShare"))
         if shares <= 0:
             continue
         total_shares += shares
         total_cost   += shares * price
-        post = _safe_float((row.get("postTransactionAmounts") or {})
-                           .get("sharesOwnedFollowingTransaction"))
+
+        post = _safe_float(_xt(txn, "postTransactionAmounts/sharesOwnedFollowingTransaction"))
         post_qty = max(post_qty, int(post))
-        if row.get("transactionDate"):
-            trade_dates.append(row["transactionDate"])
+
+        trade_date = _xt(txn, "transactionDate")
+        if trade_date:
+            trade_dates.append(trade_date)
+
         # "D" = direct: the insider's own money, not a trust, LLC or spouse.
-        if ((row.get("ownershipNature") or {})
-                .get("directOrIndirectOwnership", "").upper() == "D"):
+        if _xt(txn, "ownershipNature/directOrIndirectOwnership").upper() == "D":
             is_direct = True
 
     if total_shares <= 0:
@@ -509,9 +630,9 @@ def _parse(raw: dict) -> Optional[dict]:
     pre = post_qty - int(total_shares)
     pct_increase = round((total_shares / pre) * 100, 1) if pre > 0 else None
 
-    # Official field from the SEC's 2023 amendments to Rule 10b5-1. Far more
-    # reliable than string-matching "10b5-1" in the footnote text.
-    is_10b5 = bool(raw.get("aff10b5One")) or _footnotes_mention_10b5(raw)
+    # aff10b5One is the official flag from the SEC's 2023 amendments. Older
+    # filings predate it, so the footnotes are still worth checking.
+    is_10b5 = _xbool(root, "aff10b5One") or _footnotes_mention_10b5(root)
 
     return {
         "accession_number": accession,
@@ -521,8 +642,8 @@ def _parse(raw: dict) -> Optional[dict]:
         "insider_name":     insider_name,
         "insider_cik":      insider_cik,
         "title":            title,
-        "trade_date":       min(trade_dates) if trade_dates else (raw.get("periodOfReport") or ""),
-        "filing_date":      raw.get("filedAt") or "",
+        "trade_date":       min(trade_dates) if trade_dates else _xt(root, "periodOfReport"),
+        "filing_date":      filed_at,
         "price":            round(avg_price, 4),
         "quantity":         int(total_shares),
         "post_qty":         post_qty,
@@ -535,18 +656,13 @@ def _parse(raw: dict) -> Optional[dict]:
     }
 
 
-def _footnotes_mention_10b5(raw: dict) -> bool:
-    notes = raw.get("footnotes") or []
-    if isinstance(notes, dict):
-        notes = list(notes.values())
-    text = " ".join(
-        (n.get("text", "") if isinstance(n, dict) else str(n)) for n in notes
-    ).lower()
-    return "10b5-1" in text
+def _footnotes_mention_10b5(root: ET.Element) -> bool:
+    texts = [(f.text or "") for f in root.findall("footnotes/footnote")]
+    return "10b5-1" in " ".join(texts).lower()
 
 
 def _filing_url(issuer_cik: str, accession: str) -> str:
-    """Real EDGAR filing URL. v1.0 used the ticker as the CIK, so every link 404'd."""
+    """Human-readable EDGAR page for the filing."""
     if not issuer_cik or not accession:
         return "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=4"
     plain = accession.replace("-", "")
@@ -554,18 +670,20 @@ def _filing_url(issuer_cik: str, accession: str) -> str:
             f"{plain}/{accession}-index.htm")
 
 
-def _extract_title(rel: dict | str) -> str:
-    if isinstance(rel, str):
-        return rel or "Insider"
+def _extract_title(rel: Optional[ET.Element]) -> str:
+    if rel is None:
+        return "Insider"
     parts = []
-    if rel.get("isOfficer"):
-        parts.append(rel.get("officerTitle") or "Officer")
-    if rel.get("isDirector"):
+    if _xbool(rel, "isOfficer"):
+        parts.append(_xt(rel, "officerTitle") or "Officer")
+    if _xbool(rel, "isDirector"):
         parts.append("Director")
-    if rel.get("isTenPercentOwner"):
+    if _xbool(rel, "isTenPercentOwner"):
         parts.append("10% Owner")
-    if rel.get("isOther") and rel.get("otherText"):
-        parts.append(str(rel["otherText"]))
+    if _xbool(rel, "isOther"):
+        other = _xt(rel, "otherText")
+        if other:
+            parts.append(other)
     return ", ".join(parts) if parts else "Insider"
 
 
@@ -585,12 +703,11 @@ def get_market_data(conn: sqlite3.Connection, ticker: str) -> Optional[dict]:
     Market cap and 52-week range for a ticker, cached in SQLite.
 
     This is what makes the score aware of scale: a $100k purchase in a
-    nano-cap is enormous, in Apple it is a rounding error. Without it the
-    scoring is blind to the single most important piece of context.
+    nano-cap is enormous, in Apple it is a rounding error.
 
-    Returns None when unavailable. Every caller must handle that -- yfinance
-    is a scraper and will fail sometimes, and a missing market cap must never
-    take the bot down.
+    Returns None when unavailable. Every caller must handle that -- yfinance is
+    a scraper and will fail sometimes, and a missing market cap must never take
+    the bot down.
     """
     if not ENABLE_MARKET_DATA or not ticker:
         return None
@@ -710,12 +827,12 @@ def passes_market_filters(txn: dict) -> tuple[bool, str]:
 def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]]:
     """
     Weighted score, maximum ~22. Returns (score, breakdown). The breakdown
-    exists so you can audit why an alert fired, and so Phase 3 can test each
-    component in isolation.
+    exists so you can audit why an alert fired, and so a future backtest can
+    test each component in isolation.
 
     Honest note: these weights are heuristics, not backtest output. A wider
     scale with more components looks more sophisticated but is exactly as
-    unvalidated as the narrow one was. Do not read the score as a probability.
+    unvalidated as a narrow one. Do not read the score as a probability.
     """
     score = 0
     why: list[str] = []
@@ -835,11 +952,8 @@ def calculate_score(txn: dict, conn: sqlite3.Connection) -> tuple[int, list[str]
 def count_cluster_insiders(conn: sqlite3.Connection, txn: dict) -> int:
     """
     Number of DISTINCT insiders (excluding this one) who bought the same ticker
-    inside the cluster window.
-
-    Fixes versus v1.0: compares dates against dates rather than a date against
-    an ISO timestamp, counts people instead of filings, and reads from every
-    recorded transaction instead of only the ones that alerted.
+    inside the cluster window. Counts people, not filings, and reads from every
+    recorded transaction rather than only the ones that alerted.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=CLUSTER_WINDOW_DAYS)).date().isoformat()
     cur = conn.execute(
@@ -864,12 +978,11 @@ def count_cluster_insiders(conn: sqlite3.Connection, txn: dict) -> int:
 # ══════════════════════════════════════════════════════════════════
 
 def esc(value: Any) -> str:
-    """Escape & < > for parse_mode=HTML. v1.0 had a MarkdownV2 escaper that was
-    never called, so any 'Procter & Gamble' produced a 400 and a lost alert."""
+    """Escape & < > for parse_mode=HTML. Company names containing an ampersand
+    would otherwise produce a 400 and a silently lost alert."""
     return html.escape(str(value), quote=False)
 
 
-# Global feed of the latest insider buys on Finviz (tc=7 = latest buys).
 FINVIZ_LATEST_BUYS = os.environ.get(
     "FINVIZ_INSIDER_URL", "https://finviz.com/insidertrading?tc=7"
 )
@@ -963,13 +1076,11 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
     lines += [
         "",
         f"\U0001F4C5 Trade date: <code>{esc(txn.get('trade_date'))}</code>",
-        f"\U0001F551 Filed:      <i>{esc(str(txn.get('filing_date'))[:16].replace('T', ' '))}</i>",
+        f"\U0001F551 Filed:      <i>{esc(str(txn.get('filing_date')).replace('T', ' '))}</i>",
         f"\U0001F9EE Score:      <i>{esc(', '.join(why) if why else 'no criteria met')}</i>",
         "",
         "<i>Not financial advice. This signal has not been backtested.</i>",
     ]
-
-    keyboard = {"inline_keyboard": build_buttons(txn)}
 
     return {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -977,7 +1088,7 @@ def build_message(txn: dict, score: int, why: list[str]) -> dict:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "disable_notification": silent,
-        "reply_markup": keyboard,
+        "reply_markup": {"inline_keyboard": build_buttons(txn)},
     }
 
 
@@ -1038,18 +1149,9 @@ def send_telegram(payload: dict, dry_run: bool = False) -> bool:
     return False
 
 
-def send_plain(text: str, dry_run: bool = False) -> None:
-    send_telegram({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }, dry_run=dry_run)
-
-
 def send_status(text: str, dry_run: bool = False) -> None:
-    """Status message. Always silent (there are ~2 per run; with notifications
-    this would be unbearable) and optionally in a separate topic."""
+    """Status message. Always silent (there are ~2 per run) and optionally in a
+    separate topic."""
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -1077,47 +1179,96 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
                   dry_run: bool = False) -> dict:
     started = time.monotonic()
     lookback, why_lookback = compute_lookback(conn, lookback_minutes)
-    max_pages = pages_for(lookback)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback)
+    days = days_in_window(lookback)
 
-    log.info("Window: %dmin (%s) | %d pages max", lookback, why_lookback, max_pages)
-    log.info("Fetching Form 4 purchases filed since %s UTC", cutoff.strftime("%Y-%m-%d %H:%M"))
+    log.info("Window: %dmin (%s) | days: %s", lookback, why_lookback,
+             ", ".join(str(d) for d in days) or "none")
 
-    stats = {"fetched": 0, "alerts": 0, "skipped": 0, "filtered": 0,
-             "lookback": lookback, "error": None}
+    stats = {"downloaded": 0, "purchases": 0, "alerts": 0, "filtered": 0,
+             "lookback": lookback, "capped": False, "error": None}
 
     if STATUS_MESSAGES == "always":
         send_status(
             f"\U0001F504 <b>Cycle started</b>\n"
             f"Window: {lookback}min ({esc(why_lookback)})\n"
-            f"Since: <code>{cutoff.strftime('%Y-%m-%d %H:%M')} UTC</code>",
+            f"Days: <code>{esc(', '.join(str(d) for d in days) or 'none')}</code>",
             dry_run=dry_run,
         )
 
     try:
-        raw_filings = fetch_recent_purchases(cutoff, max_pages=max_pages)
+        _run_ingestion(conn, days, stats, dry_run)
     except (RateLimitError, RuntimeError) as exc:
         log.error("Cycle aborted: %s", exc)
         stats["error"] = str(exc)
         if STATUS_MESSAGES in ("always", "summary", "errors"):
             send_status(f"❌ <b>Cycle failed</b>\n<code>{esc(exc)}</code>",
                         dry_run=dry_run)
+        conn.commit()
         return stats
 
-    log.info("%d filings received", len(raw_filings))
-    stats["fetched"] = len(raw_filings)
+    elapsed = time.monotonic() - started
+    stats["duration"] = elapsed
 
-    # Chronological ascending order: guarantees the first buyer in a cluster is
-    # recorded before the second one is evaluated.
-    raw_filings.sort(key=lambda f: f.get("filedAt") or "")
+    log.info("cycle: %d downloaded, %d purchases, %d alerts, %d filtered in %s",
+             stats["downloaded"], stats["purchases"], stats["alerts"],
+             stats["filtered"], _fmt_duration(elapsed))
 
-    for raw in raw_filings:
-        txn = parse_filing(raw)
+    # Only mark the run successful when the backlog was fully drained. If work
+    # was capped, the window stays open so the next run continues from here.
+    if not stats["capped"]:
+        set_meta(conn, LAST_RUN_KEY, _utc_now_iso())
+    else:
+        log.info("Hit MAX_FILINGS_PER_RUN - the next run will continue the backlog")
+
+    should_report = (
+        STATUS_MESSAGES == "always"
+        or (STATUS_MESSAGES == "summary" and stats["alerts"] > 0)
+    )
+    if should_report:
+        extra = "\n⚠️ backlog capped, continuing next run" if stats["capped"] else ""
+        send_status(
+            f"✅ <b>Cycle finished</b> in {_fmt_duration(elapsed)}\n"
+            f"\U0001F4E5 {stats['downloaded']} filings downloaded\n"
+            f"\U0001F4B0 {stats['purchases']} open-market purchases\n"
+            f"\U0001F514 {stats['alerts']} alert(s) sent\n"
+            f"\U0001F6AB {stats['filtered']} filtered{extra}",
+            dry_run=dry_run,
+        )
+
+    return stats
+
+
+def _run_ingestion(conn: sqlite3.Connection, days: list[date],
+                   stats: dict, dry_run: bool) -> None:
+    """
+    Download and process new Form 4 filings.
+
+    Progress is committed as it goes: an interruption keeps everything done so
+    far, so the next run resumes instead of restarting.
+    """
+    seen_per_day: dict[str, int] = {}
+    done_per_day: dict[str, int] = {}
+
+    for entry in iter_new_filings(conn, days):
+        day_key = entry["day_key"]
+        seen_per_day.setdefault(day_key, entry["day_total"])
+
+        if stats["downloaded"] >= MAX_FILINGS_PER_RUN:
+            stats["capped"] = True
+            break
+
+        txn = fetch_and_parse(entry)
+        stats["downloaded"] += 1
+        mark_processed(conn, entry["accession"], entry["filed_date"],
+                       was_purchase=txn is not None)
+        done_per_day[day_key] = done_per_day.get(day_key, 0) + 1
+        conn.commit()
+
         if txn is None:
-            continue
+            continue   # grant, sale, option exercise -- most filings
+        stats["purchases"] += 1
 
         if already_seen(conn, txn["accession_number"]):
-            stats["skipped"] += 1
             continue
 
         # Cheap filters first: no point paying for a market-data lookup on a
@@ -1130,8 +1281,7 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
         score, why = calculate_score(txn, conn)
 
         if not passed:
-            # Record it anyway: this feeds cluster detection.
-            record_transaction(conn, txn, score, alerted=False)
+            record_transaction(conn, txn, score, alerted=False)   # feeds clusters
             stats["filtered"] += 1
             log.debug("filtered %s: %s", txn["ticker"], reason)
             continue
@@ -1151,34 +1301,17 @@ def process_cycle(conn: sqlite3.Connection, lookback_minutes: Optional[int] = No
         if sent:
             record_alert(conn, txn, score)
             stats["alerts"] += 1
-            time.sleep(0.4)  # headroom for the Telegram flood limit
+            time.sleep(0.4)   # headroom for the Telegram flood limit
 
-    elapsed = time.monotonic() - started
-    stats["duration"] = elapsed
-
-    log.info("cycle: %d filings, %d alerts, %d duplicates, %d filtered in %s",
-             stats["fetched"], stats["alerts"], stats["skipped"],
-             stats["filtered"], _fmt_duration(elapsed))
-
-    # Only now is the run marked successful. Had the fetch failed, the next
-    # cycle would cover this window again.
-    set_meta(conn, LAST_RUN_KEY, _utc_now_iso())
-
-    should_report = (
-        STATUS_MESSAGES == "always"
-        or (STATUS_MESSAGES == "summary" and stats["alerts"] > 0)
-    )
-    if should_report:
-        send_status(
-            f"✅ <b>Cycle finished</b> in {_fmt_duration(elapsed)}\n"
-            f"\U0001F4E5 {stats['fetched']} filings analysed\n"
-            f"\U0001F514 {stats['alerts']} alert(s) sent\n"
-            f"\U0001F501 {stats['skipped']} duplicate(s)\n"
-            f"\U0001F6AB {stats['filtered']} filtered",
-            dry_run=dry_run,
-        )
-
-    return stats
+    # A past day is complete once every filing it listed has been processed.
+    # Marking it means its index is never downloaded again.
+    if not stats["capped"]:
+        today = datetime.now(NY_TZ).date()
+        for day in days:
+            key = f"index_done_{day:%Y-%m-%d}"
+            if day < today and get_meta(conn, key) != "1":
+                set_meta(conn, key, "1")
+    conn.commit()
 
 
 def sleep_seconds() -> tuple[int, str]:
@@ -1188,10 +1321,10 @@ def sleep_seconds() -> tuple[int, str]:
         return 3600, "weekend"
     minutes = now.hour * 60 + now.minute
     if 9 * 60 + 30 <= minutes < 16 * 60:
-        return 300, "market hours"
+        return 900, "market hours"
     if 16 * 60 <= minutes < 18 * 60 + 30:
-        return 120, "post-close (filing peak)"
-    return 1800, "off hours"
+        return 600, "post-close (filing peak)"
+    return 3600, "off hours"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1200,8 +1333,8 @@ def sleep_seconds() -> tuple[int, str]:
 
 def check_config(dry_run: bool) -> None:
     missing = []
-    if not SEC_API_KEY:
-        missing.append("SEC_API_KEY")
+    if not EDGAR_USER_AGENT:
+        missing.append("EDGAR_USER_AGENT")
     if not dry_run:
         if not TELEGRAM_TOKEN:
             missing.append("TELEGRAM_TOKEN")
@@ -1209,7 +1342,14 @@ def check_config(dry_run: bool) -> None:
             missing.append("TELEGRAM_CHAT_ID")
     if missing:
         log.error("Missing environment variables: %s", ", ".join(missing))
+        if "EDGAR_USER_AGENT" in missing:
+            log.error("  EDGAR requires you to identify yourself. Set it to "
+                      "something like 'Your Name your@email.com'.")
         sys.exit(2)
+
+    if "@" not in EDGAR_USER_AGENT:
+        log.warning("EDGAR_USER_AGENT has no email address - the SEC may block "
+                    "your requests. Use 'Your Name your@email.com'.")
 
 
 def test_telegram() -> int:
@@ -1263,10 +1403,37 @@ def test_telegram() -> int:
     return 0
 
 
+def test_edgar() -> int:
+    """Fetch today's (or the most recent) index and report what EDGAR returns.
+    Answers 'is my User-Agent accepted and is the feed alive' in one run."""
+    log.info("EDGAR_USER_AGENT: %s", EDGAR_USER_AGENT or "(EMPTY)")
+
+    day = datetime.now(NY_TZ).date()
+    for _ in range(5):
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        url = daily_index_url(day)
+        log.info("Fetching %s", url)
+        try:
+            text = _edgar_get(url)
+        except Exception as exc:
+            log.error("FAILED: %s", exc)
+            return 1
+        if text is not None:
+            entries = parse_daily_index(text)
+            log.info("OK - %d Form 4 filings listed for %s", len(entries), day)
+            for e in entries[:3]:
+                log.info("  %s  %s", e["accession"], e["url"])
+            return 0
+        log.info("  no index for %s, trying the previous day", day)
+        day -= timedelta(days=1)
+
+    log.error("No daily index found in the last 5 business days")
+    return 1
+
+
 def log_destination() -> None:
-    """State the delivery target at startup. Without this, "it went to the wrong
-    channel" means guessing whether the problem is the secret, the workflow, or
-    the code."""
+    """State the delivery target and the active thresholds at startup."""
     chat = TELEGRAM_CHAT_ID or "(EMPTY)"
     if TELEGRAM_TOPIC_ID:
         topic = TELEGRAM_TOPIC_ID
@@ -1277,12 +1444,14 @@ def log_destination() -> None:
     log.info("Telegram target: chat=%s | topic=%s", chat, topic)
     log.info("Status messages: %s%s", STATUS_MESSAGES,
              f" (topic {STATUS_TOPIC_ID})" if STATUS_TOPIC_ID else "")
+    log.info("Source: SEC EDGAR as '%s'", EDGAR_USER_AGENT or "(EMPTY)")
     log.info("Alert threshold: score >= %d | min value: $%s | min price: $%.2f",
              SCORE_MIN_TO_SEND, f"{MIN_TRANSACTION_VALUE_USD:,}", MIN_PRICE)
-    log.info("10b5-1 penalty: -%d%s | market data: %s",
+    log.info("10b5-1 penalty: -%d%s | market data: %s | cap: %d filings/run",
              SCORE_PENALTY_10B5,
              " (excluded entirely)" if EXCLUDE_10B5 else "",
-             "on" if ENABLE_MARKET_DATA else "off")
+             "on" if ENABLE_MARKET_DATA else "off",
+             MAX_FILINGS_PER_RUN)
 
     extra = []
     if REQUIRE_DIRECT:
@@ -1313,6 +1482,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--db", default=DB_PATH, help="SQLite path")
     parser.add_argument("--test-telegram", action="store_true",
                         help="send one test message, report where it landed, then exit")
+    parser.add_argument("--test-edgar", action="store_true",
+                        help="fetch one daily index and report what EDGAR returns")
     args = parser.parse_args(argv)
 
     if args.test_telegram:
@@ -1321,6 +1492,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         return test_telegram()
 
+    if args.test_edgar:
+        return test_edgar()
+
     check_config(args.dry_run)
     log_destination()
     conn = init_db(args.db)
@@ -1328,8 +1502,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.loop:
         stats = process_cycle(conn, args.lookback, dry_run=args.dry_run)
         conn.close()
-        # Exit 1 when the cycle failed, so Actions marks the run as failed
-        # instead of green-with-a-hidden-error.
         return 1 if stats.get("error") else 0
 
     log.info("loop mode")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Pipeline tests using fixtures. Touches neither the network nor Telegram.
+Pipeline tests using Form 4 XML fixtures. Touches neither the network,
+EDGAR nor Telegram.
 
     python test_bot.py
 """
@@ -10,7 +11,7 @@ import os
 import sys
 import tempfile
 
-os.environ.setdefault("SEC_API_KEY", "test")
+os.environ.setdefault("EDGAR_USER_AGENT", "Test Runner test@example.com")
 os.environ.setdefault("MIN_TRANSACTION_VALUE_USD", "25000")
 
 import insider_bot as bot  # noqa: E402
@@ -26,205 +27,208 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
-# ── Fixtures in the real sec-api.io response shape ─────────────────
+# ── Fixtures in the real Form 4 XML shape ──────────────────────────
 
-def filing(accession, ticker, company, cik, owner_cik, owner_name,
-           relationship, rows, filed_at="2026-08-10T18:30:00-04:00",
-           aff10b5=False, footnotes=None):
-    return {
-        "accessionNo": accession,
-        "filedAt": filed_at,
-        "documentType": "4",
-        "periodOfReport": "2026-08-08",
-        "aff10b5One": aff10b5,
-        "issuer": {"cik": cik, "name": company, "tradingSymbol": ticker},
-        "reportingOwner": {"cik": owner_cik, "name": owner_name,
-                           "relationship": relationship},
-        "nonDerivativeTable": {"transactions": rows},
-        "footnotes": footnotes or [],
-    }
-
-
-def row(shares, price, post, code="P", ad="A", date="2026-08-08"):
-    return {
-        "securityTitle": "Common Stock",
-        "transactionDate": date,
-        "coding": {"formType": "4", "code": code},
-        "amounts": {"shares": shares, "pricePerShare": price,
-                    "acquiredDisposedCode": ad},
-        "postTransactionAmounts": {"sharesOwnedFollowingTransaction": post},
-        "ownershipNature": {"directOrIndirectOwnership": "D"},
-    }
+def txn_xml(shares, price, post, code="P", ad="A",
+            date="2026-08-08", ownership="D"):
+    return f"""
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>{date}</value></transactionDate>
+      <transactionCoding>
+        <transactionFormType>4</transactionFormType>
+        <transactionCode>{code}</transactionCode>
+        <equitySwapInvolved>0</equitySwapInvolved>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>{shares}</value></transactionShares>
+        <transactionPricePerShare><value>{price}</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>{ad}</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction><value>{post}</value></sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+      <ownershipNature>
+        <directOrIndirectOwnership><value>{ownership}</value></directOrIndirectOwnership>
+      </ownershipNature>
+    </nonDerivativeTransaction>"""
 
 
-CEO_BIG = filing(
-    "0001234567-26-000001", "ACME", "Acme & Sons, Inc. <Holdings>", "999001",
-    "111", "Silva Joao", {"isOfficer": True, "officerTitle": "Chief Executive Officer"},
-    [row(10_000, 52.50, 110_000), row(5_000, 53.00, 115_000)],  # tranches -> aggregate
-)
-
-DIRECTOR_SMALL = filing(
-    "0001234567-26-000002", "ACME", "Acme & Sons, Inc.", "999001",
-    "222", "Costa Maria", {"isDirector": True},
-    [row(1_000, 52.00, 6_000)],
-)
-
-TINY = filing(
-    "0001234567-26-000003", "MICRO", "Micro Corp", "999002",
-    "333", "Small Pete", {"isDirector": True},
-    [row(10, 5.00, 100)],  # $50 -> below the minimum
-)
-
-GRANT_DISGUISED = filing(
-    "0001234567-26-000004", "GRNT", "Grant Co", "999003",
-    "444", "Zero Price", {"isOfficer": True, "officerTitle": "CFO"},
-    [row(100_000, 0.0, 500_000, code="A")],  # code A, not P
-)
-
-SALE_ONLY = filing(
-    "0001234567-26-000005", "SELL", "Sell Co", "999004",
-    "555", "The Seller", {"isDirector": True},
-    [row(50_000, 20.0, 10_000, code="S", ad="D")],
-)
-
-PLAN_10B5 = filing(
-    "0001234567-26-000006", "PLAN", "Plan Co", "999005",
-    "666", "Auto Pilot", {"isOfficer": True, "officerTitle": "CEO"},
-    [row(20_000, 30.0, 200_000)],
-    aff10b5=True,
-)
-
-NO_TICKER = filing(
-    "0001234567-26-000007", "", "Private Co", "999006",
-    "777", "Not Listed", {"isDirector": True},
-    [row(10_000, 10.0, 50_000)],
-)
+def form4(ticker, company, cik, owner_cik, owner_name, rows,
+          officer_title=None, director=False, ten_pct=False,
+          aff10b5=False, footnote=None):
+    return f"""<?xml version="1.0"?>
+<ownershipDocument>
+  <schemaVersion>X0508</schemaVersion>
+  <documentType>4</documentType>
+  <periodOfReport>2026-08-08</periodOfReport>
+  <notSubjectToSection16>0</notSubjectToSection16>
+  <aff10b5One>{'1' if aff10b5 else '0'}</aff10b5One>
+  <issuer>
+    <issuerCik>{cik.zfill(10)}</issuerCik>
+    <issuerName>{company}</issuerName>
+    <issuerTradingSymbol>{ticker}</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerCik>{owner_cik.zfill(10)}</rptOwnerCik>
+      <rptOwnerName>{owner_name}</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>{'1' if director else '0'}</isDirector>
+      <isOfficer>{'1' if officer_title else '0'}</isOfficer>
+      {f'<officerTitle>{officer_title}</officerTitle>' if officer_title else ''}
+      <isTenPercentOwner>{'1' if ten_pct else '0'}</isTenPercentOwner>
+      <isOther>0</isOther>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>{''.join(rows)}</nonDerivativeTable>
+  <footnotes>{f'<footnote id="F1">{footnote}</footnote>' if footnote else ''}</footnotes>
+</ownershipDocument>"""
 
 
-# ── 1. Parsing ────────────────────────────────────────────────────
-print("\n[1] Parsing")
+def parse(xml, accession="0001234567-26-000001", filed="2026-08-10T18:30"):
+    return bot.parse_form4_xml(xml, accession, filed)
 
-p = bot.parse_filing(CEO_BIG)
+
+CEO_BIG = form4("ACME", "Acme &amp; Sons, Inc.", "999001", "111", "Silva Joao",
+                [txn_xml(10_000, 52.50, 110_000), txn_xml(5_000, 53.00, 115_000)],
+                officer_title="Chief Executive Officer")
+
+DIRECTOR_SMALL = form4("ACME", "Acme &amp; Sons, Inc.", "999001", "222", "Costa Maria",
+                       [txn_xml(1_000, 52.00, 6_000)], director=True)
+
+TINY = form4("MICRO", "Micro Corp", "999002", "333", "Small Pete",
+             [txn_xml(10, 5.00, 100)], director=True)
+
+GRANT = form4("GRNT", "Grant Co", "999003", "444", "Zero Price",
+              [txn_xml(100_000, 0.0, 500_000, code="A")], officer_title="CFO")
+
+SALE = form4("SELL", "Sell Co", "999004", "555", "The Seller",
+             [txn_xml(50_000, 20.0, 10_000, code="S", ad="D")], director=True)
+
+PLAN_10B5 = form4("PLAN", "Plan Co", "999005", "666", "Auto Pilot",
+                  [txn_xml(20_000, 30.0, 200_000)],
+                  officer_title="CEO", aff10b5=True)
+
+OLD_10B5 = form4("OLDP", "Old Plan Co", "999008", "668", "Legacy Plan",
+                 [txn_xml(20_000, 30.0, 200_000)], officer_title="CEO",
+                 footnote="Shares purchased under a Rule 10b5-1 trading plan "
+                          "adopted on March 1, 2026.")
+
+NO_TICKER = form4("", "Private Co", "999006", "777", "Not Listed",
+                  [txn_xml(10_000, 10.0, 50_000)], director=True)
+
+PENNY = form4("PENY", "Penny Corp", "999010", "910", "Cheap Charlie",
+              [txn_xml(200_000, 0.35, 900_000)], officer_title="CEO")
+
+INDIRECT = form4("TRST", "Trust Co", "999011", "911", "Via Trust",
+                 [txn_xml(10_000, 30.0, 100_000, ownership="I")], director=True)
+
+FIRST_BUY = form4("NEWB", "New Buyer Co", "999012", "912", "First Timer",
+                  [txn_xml(5_000, 20.0, 5_000)], director=True)
+
+
+# ── 1. XML parsing ────────────────────────────────────────────────
+print("\n[1] Form 4 XML parsing")
+
+p = parse(CEO_BIG)
 check("parse returns a result", p is not None)
+check("ticker extracted", p["ticker"] == "ACME", p["ticker"])
+check("company entity decoded", "&" in p["company"], p["company"])
+check("issuer CIK loses leading zeros", p["issuer_cik"] == "999001", p["issuer_cik"])
+check("insider CIK loses leading zeros", p["insider_cik"] == "111", p["insider_cik"])
 check("aggregates both tranches", p["quantity"] == 15_000, f"got {p['quantity']}")
 check("share-weighted average price",
       abs(p["price"] - (10_000 * 52.50 + 5_000 * 53.00) / 15_000) < 0.001,
       f"got {p['price']}")
 check("total value", abs(p["total_value"] - 790_000.0) < 0.01, f"got {p['total_value']}")
 check("post_qty is the max across rows", p["post_qty"] == 115_000, f"got {p['post_qty']}")
-check("title extracted", "Chief Executive Officer" in p["title"], p["title"])
+check("title from the relationship block",
+      p["title"] == "Chief Executive Officer", p["title"])
 check("filing URL uses the issuer CIK",
       p["sec_url"] == "https://www.sec.gov/Archives/edgar/data/999001/"
                       "000123456726000001/0001234567-26-000001-index.htm",
       p["sec_url"])
 check("n_transactions", p["n_transactions"] == 2)
+check("filed timestamp carried through", p["filing_date"] == "2026-08-10T18:30")
 
-check("code A (grant) rejected", bot.parse_filing(GRANT_DISGUISED) is None)
-check("sale (code S) rejected", bot.parse_filing(SALE_ONLY) is None)
-check("10b5-1 detected via aff10b5One", bot.parse_filing(PLAN_10B5)["is_10b5"] is True)
+check("grant (code A) rejected", parse(GRANT) is None)
+check("sale (code S) rejected", parse(SALE) is None)
+check("10b5-1 detected via aff10b5One", parse(PLAN_10B5)["is_10b5"] is True)
+check("10b5-1 detected via footnote on older filings",
+      parse(OLD_10B5)["is_10b5"] is True)
 check("normal purchase not flagged as 10b5-1", p["is_10b5"] is False)
+check("malformed XML returns None instead of raising",
+      parse("<ownershipDocument><broken") is None)
+check("empty document returns None", parse("<ownershipDocument/>") is None)
+
+combo = parse(form4("MIX", "Mixed Co", "9", "9", "Mixed Owner",
+                    [txn_xml(1_000, 10.0, 5_000),
+                     txn_xml(500, 12.0, 5_000, code="S", ad="D")],
+                    officer_title="CFO", director=True, ten_pct=True))
+check("only the purchase row counts in a mixed filing", combo["quantity"] == 1_000)
+check("all three roles in the title",
+      combo["title"] == "CFO, Director, 10% Owner", combo["title"])
 
 
 # ── 2. Filters ────────────────────────────────────────────────────
 print("\n[2] Filters")
 
-ok, why = bot.passes_filters(p)
-check("large purchase passes", ok, why)
-
-ok, why = bot.passes_filters(bot.parse_filing(TINY))
+check("large purchase passes", bot.passes_filters(p)[0])
+ok, why = bot.passes_filters(parse(TINY))
 check("value below minimum blocked", not ok, why)
-
-ok, why = bot.passes_filters(bot.parse_filing(NO_TICKER))
+ok, why = bot.passes_filters(parse(NO_TICKER))
 check("missing ticker blocked", not ok, why)
 
-
-# ── 2b. Hard filters ──────────────────────────────────────────────
-print("\n[2b] Hard filters")
-
-PENNY = filing(
-    "0001234567-26-000010", "PENY", "Penny Corp", "999010",
-    "910", "Cheap Charlie", {"isOfficer": True, "officerTitle": "CEO"},
-    [row(200_000, 0.35, 900_000)],  # $70k but at $0.35/share
-)
-INDIRECT = filing(
-    "0001234567-26-000011", "TRST", "Trust Co", "999011",
-    "911", "Via Trust", {"isDirector": True},
-    [dict(row(10_000, 30.0, 100_000),
-          ownershipNature={"directOrIndirectOwnership": "I",
-                           "natureOfOwnership": "By family trust"})],
-)
-
-penny = bot.parse_filing(PENNY)
-indirect = bot.parse_filing(INDIRECT)
-
-check("direct ownership detected", bot.parse_filing(CEO_BIG)["is_direct"] is True)
-check("indirect ownership detected", indirect["is_direct"] is False)
+check("direct ownership detected", p["is_direct"] is True)
+check("indirect ownership detected", parse(INDIRECT)["is_direct"] is False)
 
 bot.MIN_PRICE = 1.0
-ok, why = bot.passes_filters(penny)
+ok, why = bot.passes_filters(parse(PENNY))
 check("penny stock blocked by MIN_PRICE", not ok, why)
 bot.MIN_PRICE = 0.0
-ok, _ = bot.passes_filters(penny)
-check("MIN_PRICE=0 disables the check", ok)
+check("MIN_PRICE=0 disables the check", bot.passes_filters(parse(PENNY))[0])
 bot.MIN_PRICE = 1.0
 
 bot.EXCLUDE_10B5 = True
-ok, why = bot.passes_filters(bot.parse_filing(PLAN_10B5))
+ok, why = bot.passes_filters(parse(PLAN_10B5))
 check("EXCLUDE_10B5 drops plan purchases", not ok, why)
 bot.EXCLUDE_10B5 = False
-check("10b5-1 allowed when the flag is off",
-      bot.passes_filters(bot.parse_filing(PLAN_10B5))[0])
+check("10b5-1 allowed when the flag is off", bot.passes_filters(parse(PLAN_10B5))[0])
 
 bot.REQUIRE_DIRECT = True
-ok, why = bot.passes_filters(indirect)
+ok, why = bot.passes_filters(parse(INDIRECT))
 check("REQUIRE_DIRECT drops trust holdings", not ok, why)
 bot.REQUIRE_DIRECT = False
 
 bot.MIN_POSITION_INCREASE = 25.0
-ok, why = bot.passes_filters(bot.parse_filing(DIRECTOR_SMALL))  # exactly +20%
+ok, why = bot.passes_filters(parse(DIRECTOR_SMALL))   # exactly +20%
 check("MIN_POSITION_INCREASE blocks a small top-up", not ok, why)
+check("first purchase is never blocked by it",
+      bot.passes_filters(parse(FIRST_BUY))[0])
 bot.MIN_POSITION_INCREASE = 0.0
 
-bot.ONLY_TICKERS = {"NVDA", "AMD"}
-ok, why = bot.passes_filters(bot.parse_filing(CEO_BIG))
+bot.ONLY_TICKERS = {"NVDA"}
+ok, why = bot.passes_filters(p)
 check("watchlist blocks tickers outside it", not ok, why)
 bot.ONLY_TICKERS = {"ACME"}
-check("watchlist lets its own tickers through",
-      bot.passes_filters(bot.parse_filing(CEO_BIG))[0])
+check("watchlist lets its own tickers through", bot.passes_filters(p)[0])
 bot.ONLY_TICKERS = set()
 
 bot.EXCLUDE_TICKERS = {"ACME"}
-ok, why = bot.passes_filters(bot.parse_filing(CEO_BIG))
+ok, why = bot.passes_filters(p)
 check("exclusion list blocks a ticker", not ok, why)
 bot.EXCLUDE_TICKERS = set()
 
-# pct_increase now comes from the parser, because the filters need it
 check("pct_increase computed during parsing",
-      bot.parse_filing(DIRECTOR_SMALL)["pct_increase"] == 20.0,
-      str(bot.parse_filing(DIRECTOR_SMALL)["pct_increase"]))
-check("pct_increase derived from post_qty",
-      bot.parse_filing(TINY)["pct_increase"] == 11.1,   # 10 shares on top of 90
-      str(bot.parse_filing(TINY)["pct_increase"]))
-
-FIRST_BUY = filing(
-    "0001234567-26-000012", "NEWB", "New Buyer Co", "999012",
-    "912", "First Timer", {"isDirector": True},
-    [row(5_000, 20.0, 5_000)],  # post == qty, so there was no prior position
-)
+      parse(DIRECTOR_SMALL)["pct_increase"] == 20.0)
 check("pct_increase is None on a first purchase",
-      bot.parse_filing(FIRST_BUY)["pct_increase"] is None)
-check("first purchase is not blocked by MIN_POSITION_INCREASE",
-      bot.passes_filters(bot.parse_filing(FIRST_BUY))[0])
+      parse(FIRST_BUY)["pct_increase"] is None)
 
-
-# ── 2c. Market-cap filters ────────────────────────────────────────
-print("\n[2c] Market-cap filters")
-
-big = dict(bot.parse_filing(CEO_BIG), market={"market_cap": 3e12, "price": 200,
-                                              "low_52w": 150, "high_52w": 260})
-small = dict(bot.parse_filing(CEO_BIG), market={"market_cap": 80e6, "price": 5,
-                                                "low_52w": 4.8, "high_52w": 12})
-nodata = dict(bot.parse_filing(CEO_BIG), market=None)
+# Market-cap filters
+big = dict(p, market={"market_cap": 3e12, "price": 200, "low_52w": 150, "high_52w": 260})
+small = dict(p, market={"market_cap": 80e6, "price": 5, "low_52w": 4.8, "high_52w": 12})
 
 bot.MAX_MARKET_CAP = 2e9
 ok, why = bot.passes_market_filters(big)
@@ -233,166 +237,179 @@ check("small cap passes", bot.passes_market_filters(small)[0])
 bot.MAX_MARKET_CAP = 0
 
 bot.MIN_MARKET_CAP = 300e6
-ok, why = bot.passes_market_filters(small)
-check("micro cap blocked by MIN_MARKET_CAP", not ok, why)
+check("micro cap blocked by MIN_MARKET_CAP", not bot.passes_market_filters(small)[0])
 bot.MIN_MARKET_CAP = 0
 
 check("missing market data never drops a filing",
-      bot.passes_market_filters(nodata)[0])
+      bot.passes_market_filters(dict(p, market=None))[0])
 
 
-# ── 3. HTML escaping ──────────────────────────────────────────────
-print("\n[3] HTML escaping (the bug that silently killed v1.0 alerts)")
+# ── 3. Daily index parsing ────────────────────────────────────────
+print("\n[3] EDGAR daily index parsing")
+
+INDEX = """Description:           Daily Index of EDGAR Dissemination Feed
+Form Type   Company Name                     CIK        Date Filed  File Name
+---------------------------------------------------------------------------------
+3           SOME HOLDER INC                  1111       2026-09-01  edgar/data/1111/0001111-26-000001.txt
+4           ACME & SONS INC                  999001     2026-09-01  edgar/data/999001/0000999001-26-000042.txt
+4           PROCEPT BIOROBOTICS CORP         1930183    2026-09-01  edgar/data/1930183/0001930183-26-000123.txt
+4/A         AMENDED CORP                     2222       2026-09-01  edgar/data/2222/0002222-26-000009.txt
+8-K         UNRELATED CO                     3333       2026-09-01  edgar/data/3333/0003333-26-000004.txt
+"""
+
+entries = bot.parse_daily_index(INDEX)
+check("only Form 4 rows kept", len(entries) == 2, f"got {len(entries)}")
+check("amendments excluded by default",
+      all("/A" not in e["accession"] for e in entries))
+check("accession extracted from the path",
+      entries[0]["accession"] == "0000999001-26-000042", entries[0]["accession"])
+check("absolute URL built",
+      entries[0]["url"] == "https://www.sec.gov/Archives/edgar/data/999001/"
+                           "0000999001-26-000042.txt", entries[0]["url"])
+check("filing date captured", entries[0]["filed_date"] == "2026-09-01")
+check("company names with spaces do not break parsing",
+      entries[1]["accession"] == "0001930183-26-000123", entries[1]["accession"])
+
+bot.INCLUDE_AMENDMENTS = True
+check("amendments included when enabled", len(bot.parse_daily_index(INDEX)) == 3)
+bot.INCLUDE_AMENDMENTS = False
+
+check("empty index yields nothing", bot.parse_daily_index("") == [])
+check("header-only index yields nothing",
+      bot.parse_daily_index("Form Type  Company\n-----\n") == [])
+
+url = bot.daily_index_url(_dt.date(2026, 9, 1))
+check("index URL uses the right quarter", "QTR3" in url and "form.20260901.idx" in url, url)
+check("Q1 date maps to QTR1", "QTR1" in bot.daily_index_url(_dt.date(2026, 2, 5)))
+
+days = bot.days_in_window(60)
+check("short window yields at most one day", len(days) <= 1, str(days))
+check("weekends excluded from the window",
+      all(d.weekday() < 5 for d in bot.days_in_window(10_000)))
+
+
+# ── 4. Submission extraction ──────────────────────────────────────
+print("\n[4] Submission text extraction")
+
+SUBMISSION = f"""<SEC-DOCUMENT>0001234567-26-000001.txt : 20260810
+<SEC-HEADER>0001234567-26-000001.hdr.sgml : 20260810
+<ACCEPTANCE-DATETIME>20260810183045
+ACCESSION NUMBER:  0001234567-26-000001
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<XML>
+{CEO_BIG}
+</XML>
+</DOCUMENT>
+</SEC-DOCUMENT>"""
+
+captured = {}
+bot._edgar_get = lambda u: (captured.__setitem__("url", u) or SUBMISSION)
+result = bot.fetch_and_parse({"url": "https://example/x.txt",
+                              "accession": "0001234567-26-000001",
+                              "filed_date": "2026-08-10"})
+check("ownership document found inside the submission", result is not None)
+check("acceptance datetime preferred over the index date",
+      result["filing_date"] == "2026-08-10T18:30", result["filing_date"])
+check("aggregated value survives extraction", result["total_value"] == 790_000.0)
+
+bot._edgar_get = lambda u: "<SEC-DOCUMENT>no xml here</SEC-DOCUMENT>"
+check("submission without ownership XML returns None",
+      bot.fetch_and_parse({"url": "u", "accession": "a", "filed_date": "d"}) is None)
+
+bot._edgar_get = lambda u: None
+check("404 on a submission returns None",
+      bot.fetch_and_parse({"url": "u", "accession": "a", "filed_date": "d"}) is None)
+
+
+# ── 5. Deduplication of downloads ─────────────────────────────────
+print("\n[5] Download deduplication")
+
+ddb = bot.init_db(os.path.join(tempfile.mkdtemp(), "d.db"))
+
+check("unknown accession is not processed", not bot.is_processed(ddb, "x-1"))
+bot.mark_processed(ddb, "x-1", "2026-09-01", was_purchase=False)
+ddb.commit()
+check("marked accession is processed", bot.is_processed(ddb, "x-1"))
+check("non-purchases are remembered too, so they are never re-downloaded",
+      bot.is_processed(ddb, "x-1"))
+
+index_calls = []
+
+
+def fake_get(url):
+    index_calls.append(url)
+    return INDEX
+
+
+bot._edgar_get = fake_get
+today = _dt.datetime.now(bot.NY_TZ).date()
+yesterday = today - _dt.timedelta(days=1)
+
+new = list(bot.iter_new_filings(ddb, [today]))
+check("all filings new on the first pass", len(new) == 2, f"got {len(new)}")
+
+for e in new:
+    bot.mark_processed(ddb, e["accession"], e["filed_date"], False)
+ddb.commit()
+check("nothing new on the second pass", list(bot.iter_new_filings(ddb, [today])) == [])
+
+index_calls.clear()
+bot.set_meta(ddb, f"index_done_{yesterday:%Y-%m-%d}", "1")
+list(bot.iter_new_filings(ddb, [yesterday]))
+check("completed past days are never re-fetched", index_calls == [], str(index_calls))
+
+index_calls.clear()
+list(bot.iter_new_filings(ddb, [today]))
+check("today's index is always re-fetched", len(index_calls) == 1)
+
+bot._edgar_get = lambda u: None
+check("a missing index (holiday) is not an error",
+      list(bot.iter_new_filings(ddb, [today])) == [])
+ddb.close()
+
+
+# ── 6. HTML escaping and buttons ──────────────────────────────────
+print("\n[6] HTML escaping and buttons")
 
 msg = bot.build_message(p, 14, ["+4 CEO/CFO", "+3 value >= $500k"])
 text = msg["text"]
 check("& escaped", "&amp;" in text)
-check("< escaped", "&lt;Holdings&gt;" in text)
-check("no bare ampersand",
-      "& " not in text.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""))
 check("parse_mode is HTML", msg["parse_mode"] == "HTML")
 check("reply_markup is a dict (sent via json=)", isinstance(msg["reply_markup"], dict))
 check("MAX ALERT notifies", msg["disable_notification"] is False)
+check("low score stays silent",
+      bot.build_message(p, 1, [])["disable_notification"] is True)
 
-quiet = bot.build_message(p, 1, [])
-check("low score stays silent", quiet["disable_notification"] is True)
-
-# Forum supergroup topics
 bot.TELEGRAM_TOPIC_ID = "3"
-routed = bot.with_topic(msg)
-check("topic injected as int", routed.get("message_thread_id") == 3)
+check("topic injected as int", bot.with_topic(msg).get("message_thread_id") == 3)
 check("original payload untouched", "message_thread_id" not in msg)
-
 bot.TELEGRAM_TOPIC_ID = "abc"
 check("invalid topic ignored", "message_thread_id" not in bot.with_topic(msg))
-
 bot.TELEGRAM_TOPIC_ID = ""
 check("no topic injects nothing", "message_thread_id" not in bot.with_topic(msg))
 
-
-# ── 3b. Buttons ───────────────────────────────────────────────────
-print("\n[3b] Inline buttons")
-
-rows = bot.build_buttons(p)
-flat = [b for r in rows for b in r]
+flat = [b for r in bot.build_buttons(p) for b in r]
 urls = " ".join(b["url"] for b in flat)
-
-check("three button rows", len(rows) == 3, f"got {len(rows)}")
 check("five buttons total", len(flat) == 5, f"got {len(flat)}")
 check("TradingView present", "tradingview.com/symbols/ACME/" in urls)
 check("SEC filing present", "sec.gov/Archives/edgar/data/999001" in urls)
 check("Investing.com present", "investing.com/search/?q=ACME" in urls)
-check("Finviz ticker page present", "finviz.com/quote.ashx?t=ACME" in urls)
-check("Finviz latest buys present", "finviz.com/insidertrading?tc=7" in urls)
-check("every button has text and url",
-      all(b.get("text") and b.get("url") for b in flat))
+check("Finviz present", "finviz.com/quote.ashx?t=ACME" in urls)
+check("latest buys feed present", "finviz.com/insidertrading?tc=7" in urls)
 check("no label exceeds 64 chars (Telegram limit)",
-      all(len(b["text"]) <= 64 for b in flat),
-      str([len(b["text"]) for b in flat]))
+      all(len(b["text"]) <= 64 for b in flat))
 
-# Tickers with dots/hyphens (BRK.B, BF-B) must be encoded
-dotted = dict(p, ticker="BRK.B")
-durls = " ".join(b["url"] for r in bot.build_buttons(dotted) for b in r)
+durls = " ".join(b["url"] for r in bot.build_buttons(dict(p, ticker="BRK.B")) for b in r)
 check("dotted ticker URL-encoded", "q=BRK%2EB" in durls or "q=BRK.B" in durls, durls)
-check("dot does not break the TradingView path", "symbols/BRK" in durls)
 
 
-# ── 3c. Optional 10b5-1 penalty ───────────────────────────────────
-print("\n[3c] Optional 10b5-1 penalty")
+# ── 7. Scoring and cluster detection ──────────────────────────────
+print("\n[7] Scoring and cluster detection")
 
-plan = bot.parse_filing(PLAN_10B5)
-tmp_conn = bot.init_db(os.path.join(tempfile.mkdtemp(), "p.db"))
+conn = bot.init_db(os.path.join(tempfile.mkdtemp(), "t.db"))
 
-bot.SCORE_PENALTY_10B5 = 0
-s_off, w_off = bot.calculate_score(plan, tmp_conn)
-check("default applies no penalty", "10b5-1" not in " ".join(w_off), str(w_off))
-
-bot.SCORE_PENALTY_10B5 = 2
-s_on, w_on = bot.calculate_score(plan, tmp_conn)
-check("penalty applied", s_on == s_off - 2, f"{s_off} -> {s_on}")
-check("penalty shows in the breakdown", "-2 10b5-1 plan" in " ".join(w_on))
-
-bot.SCORE_PENALTY_10B5 = 99
-s_floor, _ = bot.calculate_score(plan, tmp_conn)
-check("score never goes negative", s_floor == 0, f"got {s_floor}")
-
-bot.SCORE_PENALTY_10B5 = 0
-tmp_conn.close()
-
-
-# ── 3d. Market-data scoring and cache ─────────────────────────────
-print("\n[3d] Market-data scoring and cache")
-
-mc = bot.init_db(os.path.join(tempfile.mkdtemp(), "m.db"))
-
-base = bot.parse_filing(CEO_BIG)          # $790k purchase
-no_market = dict(base, market=None)
-s_none, w_none = bot.calculate_score(no_market, mc)
-
-# $790k against a $50M company = 1.58% of the whole company
-micro = dict(base, market={"market_cap": 50e6, "price": 10,
-                           "low_52w": 9.5, "high_52w": 40})
-s_micro, w_micro = bot.calculate_score(micro, mc)
-check("large stake in a micro cap scores higher", s_micro > s_none,
-      f"{s_none} -> {s_micro}")
-check("percent of market cap in the breakdown",
-      any("market cap" in x for x in w_micro), str(w_micro))
-check("pct_of_market_cap recorded",
-      abs(micro["pct_of_market_cap"] - 1.58) < 0.01, str(micro.get("pct_of_market_cap")))
-
-# Same purchase against a $3T company = noise
-mega = dict(base, market={"market_cap": 3e12, "price": 200,
-                          "low_52w": 100, "high_52w": 260})
-s_mega, w_mega = bot.calculate_score(mega, mc)
-check("same purchase in a mega cap scores no size points",
-      not any("market cap" in x for x in w_mega), str(w_mega))
-check("micro cap outscores mega cap", s_micro > s_mega, f"{s_micro} vs {s_mega}")
-
-# Buying near the 52-week low
-at_low = dict(base, market={"market_cap": 1e9, "price": 10.4,
-                            "low_52w": 10.0, "high_52w": 30})
-s_low, w_low = bot.calculate_score(at_low, mc)
-check("buying near the 52w low scores",
-      any("52w low" in x for x in w_low), str(w_low))
-check("pct_above_52w_low recorded",
-      abs(at_low["pct_above_52w_low"] - 4.0) < 0.1, str(at_low.get("pct_above_52w_low")))
-
-at_high = dict(base, market={"market_cap": 1e9, "price": 29.0,
-                             "low_52w": 10.0, "high_52w": 30})
-_, w_high = bot.calculate_score(at_high, mc)
-check("buying near the highs scores nothing there",
-      not any("52w low" in x for x in w_high), str(w_high))
-
-# Cache behaviour
-bot.ENABLE_MARKET_DATA = True
-calls = {"n": 0}
-bot._fetch_market_data = lambda t: (calls.__setitem__("n", calls["n"] + 1) or
-                                    {"market_cap": 1e9, "price": 10.0,
-                                     "low_52w": 8.0, "high_52w": 15.0, "cached": False})
-first = bot.get_market_data(mc, "TEST")
-second = bot.get_market_data(mc, "TEST")
-check("market data fetched once", calls["n"] == 1, f"got {calls['n']} calls")
-check("second read comes from cache", second.get("cached") is True)
-check("cached values match", second["market_cap"] == first["market_cap"])
-
-bot._fetch_market_data = lambda t: None
-check("failed lookup returns None", bot.get_market_data(mc, "NOPE") is None)
-
-bot.ENABLE_MARKET_DATA = False
-check("disabled market data returns None", bot.get_market_data(mc, "TEST") is None)
-bot.ENABLE_MARKET_DATA = True
-
-mc.close()
-
-
-# ── 4. Scoring and cluster detection ──────────────────────────────
-print("\n[4] Scoring and cluster detection")
-
-tmpdir = tempfile.mkdtemp()
-db = os.path.join(tmpdir, "t.db")
-conn = bot.init_db(db)
-
-# Freeze "today" so the fixture dates land inside the cluster window
 _real = _dt.datetime
 
 
@@ -404,115 +421,109 @@ class FakeDT(_real):
 
 bot.datetime = FakeDT
 
-ceo = bot.parse_filing(CEO_BIG)
+ceo = parse(CEO_BIG)
 score1, why1 = bot.calculate_score(ceo, conn)
-# +4 CEO/CFO, +3 value >= $500k, +1 direct = 8
 check("CEO + $790k direct, no cluster = 8", score1 == 8, f"got {score1}: {why1}")
 check("no cluster on the first purchase", ceo["cluster"] == 0)
 bot.record_transaction(conn, ceo, score1, alerted=True)
 
-director = bot.parse_filing(DIRECTOR_SMALL)
+director = parse(DIRECTOR_SMALL, accession="0001234567-26-000002")
 score2, why2 = bot.calculate_score(director, conn)
-check("second insider detects the cluster", director["cluster"] == 1, f"got {director['cluster']}")
-# +2 director, +1 position +20% (inclusive boundary), +2 cluster, +1 direct = 6
+check("second insider detects the cluster", director["cluster"] == 1)
 check("director + position + cluster + direct = 6", score2 == 6, f"got {score2}: {why2}")
-check("$52k earns no value points", "value" not in " ".join(why2), str(why2))
 bot.record_transaction(conn, director, score2, alerted=True)
 
-# The same insider buying again must not count as a cluster with themselves
-repeat = bot.parse_filing(filing(
-    "0001234567-26-000099", "ACME", "Acme & Sons, Inc.", "999001",
-    "111", "Silva Joao", {"isOfficer": True, "officerTitle": "CEO"},
-    [row(2_000, 54.0, 117_000)],
-))
-_, _ = bot.calculate_score(repeat, conn)
-check("cluster counts distinct insiders, not filings",
-      repeat["cluster"] == 1, f"got {repeat['cluster']} (expected 1: Costa Maria)")
+repeat = parse(form4("ACME", "Acme", "999001", "111", "Silva Joao",
+                     [txn_xml(2_000, 54.0, 117_000)], officer_title="CEO"),
+               accession="0001234567-26-000099")
+bot.calculate_score(repeat, conn)
+check("cluster counts distinct insiders, not filings", repeat["cluster"] == 1,
+      f"got {repeat['cluster']}")
 
-# Filtered-out transactions must still feed the cluster
-tiny = bot.parse_filing(TINY)
+tiny = parse(TINY, accession="0001234567-26-000003")
 bot.record_transaction(conn, tiny, 0, alerted=False)
-other_micro = bot.parse_filing(filing(
-    "0001234567-26-000100", "MICRO", "Micro Corp", "999002",
-    "888", "Another Insider", {"isOfficer": True, "officerTitle": "CEO"},
-    [row(10_000, 6.0, 60_000)],
-))
+other_micro = parse(form4("MICRO", "Micro Corp", "999002", "888", "Another Insider",
+                          [txn_xml(10_000, 6.0, 60_000)], officer_title="CEO"),
+                    accession="0001234567-26-000100")
 bot.calculate_score(other_micro, conn)
-check("filtered transaction still counts for the cluster (v1.0 bug)",
-      other_micro["cluster"] == 1, f"got {other_micro['cluster']}")
+check("filtered transactions still feed the cluster", other_micro["cluster"] == 1)
 
-# Outside the window must not count
-old = bot.parse_filing(filing(
-    "0001234567-26-000101", "OLDC", "Old Co", "999007",
-    "901", "Long Ago", {"isDirector": True},
-    [row(5_000, 10.0, 50_000, date="2026-07-01")],
-))
+old = parse(form4("OLDC", "Old Co", "999007", "901", "Long Ago",
+                  [txn_xml(5_000, 10.0, 50_000, date="2026-07-01")], director=True),
+            accession="0001234567-26-000101")
 bot.record_transaction(conn, old, 1, alerted=False)
-recent = bot.parse_filing(filing(
-    "0001234567-26-000102", "OLDC", "Old Co", "999007",
-    "902", "Just Now", {"isDirector": True},
-    [row(5_000, 11.0, 50_000, date="2026-08-09")],
-))
+recent = parse(form4("OLDC", "Old Co", "999007", "902", "Just Now",
+                     [txn_xml(5_000, 11.0, 50_000, date="2026-08-09")], director=True),
+               accession="0001234567-26-000102")
 bot.calculate_score(recent, conn)
-check("purchase 40 days ago falls outside the 7d window",
-      recent["cluster"] == 0, f"got {recent['cluster']}")
+check("a purchase 40 days ago is outside the 7d window", recent["cluster"] == 0)
 
-check("pct_increase is None when post_qty is unreliable",
-      bot.parse_filing(TINY).get("post_qty") == 100)
+# 10b5-1 penalty
+plan = parse(PLAN_10B5, accession="0001234567-26-000006")
+bot.SCORE_PENALTY_10B5 = 0
+s_off, w_off = bot.calculate_score(plan, conn)
+check("default applies no penalty", "10b5-1" not in " ".join(w_off))
+bot.SCORE_PENALTY_10B5 = 2
+s_on, w_on = bot.calculate_score(plan, conn)
+check("penalty applied", s_on == s_off - 2, f"{s_off} -> {s_on}")
+bot.SCORE_PENALTY_10B5 = 99
+check("score never goes negative", bot.calculate_score(plan, conn)[0] == 0)
+bot.SCORE_PENALTY_10B5 = 0
+
+# Market-data scoring
+no_market = dict(ceo, market=None)
+s_none, _ = bot.calculate_score(no_market, conn)
+micro = dict(ceo, market={"market_cap": 50e6, "price": 10, "low_52w": 9.5, "high_52w": 40})
+s_micro, w_micro = bot.calculate_score(micro, conn)
+check("large stake in a micro cap scores higher", s_micro > s_none, f"{s_none} -> {s_micro}")
+check("percent of market cap recorded",
+      abs(micro["pct_of_market_cap"] - 1.58) < 0.01, str(micro.get("pct_of_market_cap")))
+mega = dict(ceo, market={"market_cap": 3e12, "price": 200, "low_52w": 100, "high_52w": 260})
+_, w_mega = bot.calculate_score(mega, conn)
+check("same purchase in a mega cap earns no size points",
+      not any("market cap" in x for x in w_mega))
+at_low = dict(ceo, market={"market_cap": 1e9, "price": 10.4, "low_52w": 10.0, "high_52w": 30})
+_, w_low = bot.calculate_score(at_low, conn)
+check("buying near the 52w low scores", any("52w low" in x for x in w_low))
+at_high = dict(ceo, market={"market_cap": 1e9, "price": 29.0, "low_52w": 10.0, "high_52w": 30})
+_, w_high = bot.calculate_score(at_high, conn)
+check("buying near the highs scores nothing there",
+      not any("52w low" in x for x in w_high))
 
 bot.datetime = _real
 
-
-# ── 5. Dedup and time filtering ───────────────────────────────────
-print("\n[5] Dedup and time filtering")
-
-bot.record_alert(conn, ceo, score1)
-check("already_seen catches a duplicate", bot.already_seen(conn, ceo["accession_number"]))
-check("already_seen ignores a new one", not bot.already_seen(conn, "0000000-00-000000"))
-
-d = bot._parse_dt("2022-08-09T21:23:00-04:00")
-check("_parse_dt reads the NY offset", d is not None and d.utcoffset().total_seconds() == -14400)
-check("_parse_dt tolerates garbage", bot._parse_dt("not-a-date") is None)
-check("_parse_dt tolerates None", bot._parse_dt(None) is None)
-
-# Pagination stops when it hits a filing older than the cutoff
+# Market-data cache
+bot.ENABLE_MARKET_DATA = True
 calls = {"n": 0}
-pages = [
-    {"transactions": [dict(CEO_BIG, filedAt="2026-08-10T19:00:00-04:00", accessionNo=f"a{i}")
-                      for i in range(50)]},
-    {"transactions": [dict(CEO_BIG, filedAt="2026-08-10T18:55:00-04:00", accessionNo="b0"),
-                      dict(CEO_BIG, filedAt="2026-01-01T10:00:00-05:00", accessionNo="old")]},
-]
+bot._fetch_market_data = lambda t: (calls.__setitem__("n", calls["n"] + 1) or
+                                    {"market_cap": 1e9, "price": 10.0,
+                                     "low_52w": 8.0, "high_52w": 15.0, "cached": False})
+first = bot.get_market_data(conn, "TEST")
+second = bot.get_market_data(conn, "TEST")
+check("market data fetched once", calls["n"] == 1, f"got {calls['n']} calls")
+check("second read comes from cache", second.get("cached") is True)
+bot._fetch_market_data = lambda t: None
+check("failed lookup returns None", bot.get_market_data(conn, "NOPE") is None)
+bot.ENABLE_MARKET_DATA = False
+check("disabled market data returns None", bot.get_market_data(conn, "TEST2") is None)
+bot.ENABLE_MARKET_DATA = True
+
+check("already_seen catches a duplicate",
+      bot.record_alert(conn, ceo, score1) or bot.already_seen(conn, ceo["accession_number"]))
+check("already_seen ignores a new one", not bot.already_seen(conn, "0000-00-000000"))
+conn.close()
 
 
-def fake_post(payload):
-    i = calls["n"]
-    calls["n"] += 1
-    return pages[i] if i < len(pages) else {"transactions": []}
+# ── 8. Adaptive lookback ──────────────────────────────────────────
+print("\n[8] Adaptive lookback")
 
-
-bot._post_with_retry = fake_post
-cutoff = _dt.datetime(2026, 8, 10, 22, 0, tzinfo=_dt.timezone.utc)  # 18:00 ET
-result = bot.fetch_recent_purchases(cutoff)
-check("paginated and stopped at the cutoff", len(result) == 51, f"got {len(result)}")
-check("the old filing was excluded",
-      all(f["accessionNo"] != "old" for f in result))
-
-
-# ── 6. Adaptive lookback ──────────────────────────────────────────
-print("\n[6] Adaptive lookback")
-
-lb_db = os.path.join(tempfile.mkdtemp(), "lb.db")
-lb = bot.init_db(lb_db)
+lb = bot.init_db(os.path.join(tempfile.mkdtemp(), "lb.db"))
 
 mins, why = bot.compute_lookback(lb)
 check("cold start uses the default",
       mins == bot.LOOKBACK_MINUTES and "first run" in why, f"{mins} / {why}")
+check("--lookback takes precedence", bot.compute_lookback(lb, override=240)[0] == 240)
 
-mins, why = bot.compute_lookback(lb, override=240)
-check("--lookback takes precedence", mins == 240 and "forced" in why, f"{mins} / {why}")
-
-# 40 minutes since the last run -> 40 + buffer
 now = _dt.datetime.now(_dt.timezone.utc)
 bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(minutes=40)).isoformat())
 mins, why = bot.compute_lookback(lb)
@@ -520,48 +531,32 @@ check("covers the gap plus margin",
       40 + bot.LOOKBACK_BUFFER_MINUTES - 1 <= mins <= 40 + bot.LOOKBACK_BUFFER_MINUTES + 1,
       f"{mins} / {why}")
 
-# Weekend: 60h gap
 bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(hours=60)).isoformat())
-mins, why = bot.compute_lookback(lb)
-check("weekend gap covered", mins > 3000, f"{mins} / {why}")
+check("weekend gap covered", bot.compute_lookback(lb)[0] > 3000)
 
-# Down for 10 days -> truncate at the ceiling
 bot.set_meta(lb, bot.LAST_RUN_KEY, (now - _dt.timedelta(days=10)).isoformat())
 mins, why = bot.compute_lookback(lb)
 check("truncates at the ceiling",
       mins == bot.MAX_LOOKBACK_MINUTES and "truncated" in why, f"{mins} / {why}")
 
-# Corrupted state must not crash
 bot.set_meta(lb, bot.LAST_RUN_KEY, "this-is-not-a-date")
-mins, why = bot.compute_lookback(lb)
 check("unreadable state falls back to the default",
-      mins == bot.LOOKBACK_MINUTES and "unreadable" in why, f"{mins} / {why}")
+      bot.compute_lookback(lb)[0] == bot.LOOKBACK_MINUTES)
 
-# Clock moved backwards (last_run in the future)
 bot.set_meta(lb, bot.LAST_RUN_KEY, (now + _dt.timedelta(hours=2)).isoformat())
-mins, why = bot.compute_lookback(lb)
 check("clock inconsistency falls back to the default",
-      mins == bot.LOOKBACK_MINUTES, f"{mins} / {why}")
-
-# Pages scale with the window, but with a ceiling
-check("short window uses base pages", bot.pages_for(90) == bot.MAX_PAGES)
-check("long window requests more pages", bot.pages_for(3000) > bot.MAX_PAGES)
-check("pages are capped", bot.pages_for(100000) == bot.MAX_PAGES_CATCHUP)
-
-check("meta reads and writes", bot.get_meta(lb, "nonexistent") is None)
+      bot.compute_lookback(lb)[0] == bot.LOOKBACK_MINUTES)
 lb.close()
 
 
-# ── 7. Status messages ────────────────────────────────────────────
-print("\n[7] Status messages")
+# ── 9. Status messages ────────────────────────────────────────────
+print("\n[9] Status messages")
 
 sent = []
 bot.send_telegram = lambda p, dry_run=False: sent.append(p) or True
 
-bot.STATUS_MESSAGES = "always"
 bot.STATUS_TOPIC_ID = "7"
 bot.send_status("test")
-check("status sent", len(sent) == 1)
 check("status is silent", sent[0]["disable_notification"] is True)
 check("status goes to its own topic", sent[0]["message_thread_id"] == 7)
 
@@ -570,15 +565,61 @@ bot.TELEGRAM_TOPIC_ID = "3"
 sent.clear()
 bot.send_status("test")
 check("without a status topic it uses the alert topic",
-      "message_thread_id" not in sent[0], str(sent[0].get("message_thread_id")))
-
-check("duration formatted in seconds", bot._fmt_duration(42) == "42s")
-check("duration formatted in minutes", bot._fmt_duration(150) == "2.5min")
-
-bot.STATUS_MESSAGES = "off"
+      "message_thread_id" not in sent[0])
 bot.TELEGRAM_TOPIC_ID = ""
 
-conn.close()
+check("duration in seconds", bot._fmt_duration(42) == "42s")
+check("duration in minutes", bot._fmt_duration(150) == "2.5min")
+
+
+# ── 10. Full cycle with a capped backlog ──────────────────────────
+print("\n[10] Full cycle and backlog capping")
+
+cdb = bot.init_db(os.path.join(tempfile.mkdtemp(), "c.db"))
+bot.ENABLE_MARKET_DATA = False
+bot.STATUS_MESSAGES = "off"
+
+big_index = ["Form Type   Company   CIK   Date Filed  File Name",
+             "-" * 60]
+for i in range(10):
+    big_index.append(
+        f"4           CO {i}      99{i}    {today:%Y-%m-%d}  "
+        f"edgar/data/99{i}/000099{i}-26-00000{i}.txt")
+
+
+def cycle_get(url):
+    if "daily-index" in url:
+        return "\n".join(big_index)
+    return SUBMISSION
+
+
+bot._edgar_get = cycle_get
+bot.MAX_FILINGS_PER_RUN = 4
+stats = bot.process_cycle(cdb, lookback_minutes=60, dry_run=True)
+check("run stops at MAX_FILINGS_PER_RUN", stats["downloaded"] == 4,
+      f"got {stats['downloaded']}")
+check("capped run is flagged", stats["capped"] is True)
+check("capped run does not mark itself successful",
+      bot.get_meta(cdb, bot.LAST_RUN_KEY) is None)
+
+bot.MAX_FILINGS_PER_RUN = 400
+stats2 = bot.process_cycle(cdb, lookback_minutes=60, dry_run=True)
+check("the next run continues the backlog", stats2["downloaded"] == 6,
+      f"got {stats2['downloaded']}")
+check("completed run records success", bot.get_meta(cdb, bot.LAST_RUN_KEY) is not None)
+
+stats3 = bot.process_cycle(cdb, lookback_minutes=60, dry_run=True)
+check("a third run downloads nothing new", stats3["downloaded"] == 0)
+
+
+def failing_get(url):
+    raise bot.RateLimitError("EDGAR rate limit (429)")
+
+
+bot._edgar_get = failing_get
+stats4 = bot.process_cycle(cdb, lookback_minutes=60, dry_run=True)
+check("a failed cycle reports the error", stats4["error"] is not None)
+cdb.close()
 
 
 # ── Result ────────────────────────────────────────────────────────

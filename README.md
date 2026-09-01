@@ -1,4 +1,4 @@
-# SEC Insider Trading Alert Bot v1.2
+# SEC Insider Trading Alert Bot v2.0
 
 Telegram alerts for open-market insider purchases (SEC Form 4, code `P`). Runs on GitHub Actions cron — no server, no hosting cost.
 
@@ -6,23 +6,39 @@ Telegram alerts for open-market insider purchases (SEC Form 4, code `P`). Runs o
 
 ---
 
-## What changed from v1.0
+## Data source: SEC EDGAR
 
-| # | v1.0 bug | Fix |
-|---|---|---|
-| 1 | Endpoint `/form-4` and a nested `query_string` object — the API accepts neither | `/insider-trading` with a plain Lucene query string |
-| 2 | Wrong field paths: `raw["ticker"]`, `transactionCoding.transactionCode`, `transactionAmounts.transactionShares` | `issuer.tradingSymbol`, `coding.code`, `amounts.shares` |
-| 3 | `datetime.utcnow()` compared against `filedAt` in New York time → the query returned almost nothing | Local filtering with timezone-aware datetimes plus pagination to the cutoff |
-| 4 | `_esc()` written for MarkdownV2 and never called, with `parse_mode: HTML` → "Procter & Gamble" produced a 400 | `html.escape()` on every dynamic field |
-| 5 | `sec_url` used the ticker as the CIK → every link 404'd | EDGAR URL built from `issuer.cik` + accession number |
-| 6 | Only the first `P` row per filing was read | Aggregates all `P`/`A` rows with a share-weighted average price |
-| 7 | 10b5-1 detected via `str(raw).lower()` | Official `aff10b5One` field (with a footnote fallback) |
-| 8 | Cluster detection compared `YYYY-MM-DD` against an ISO timestamp, counted filings instead of people, and read only from sent alerts | Dates against dates, distinct insiders, reads **every** recorded transaction |
-| 9 | `RateLimitError` used before it was defined | Defined at the top |
-| 10 | `while True` on Colab — dies when the runtime disconnects | One cycle per invocation, with an optional `--loop` |
-| 11 | Credentials hardcoded in the file | Everything via environment variables |
+v1.x used sec-api.io. Its free tier is **100 calls, lifetime** — the bot exhausted it within days and then failed every run. v2.0 reads EDGAR directly: free, no key, no quota. EDGAR is the primary source those services resell.
 
-Added since: adaptive lookback, cycle status messages, forum-topic routing, exponential backoff, Telegram flood-limit handling, a score breakdown on every alert (`+3 CEO/CFO, +3 value >= $500k`), `acquiredDisposedCode` filtering, `--dry-run`, `--test-telegram`, and 106 fixture tests.
+The SEC asks two things in return, both handled here: identify yourself with a `User-Agent` containing a contact email, and stay under 10 requests/second.
+
+### How ingestion works
+
+1. EDGAR publishes a **daily index** of every filing. The bot reads the index for each day in the window and keeps the Form 4 rows.
+2. Accessions already in `processed_filings` are skipped, so only genuinely new filings are downloaded.
+3. Each new filing is one request for the complete submission `.txt`, which has the ownership XML embedded.
+4. Indexes for past days are immutable — once a day is fully processed it is marked done and never fetched again. Only today's index is re-read.
+
+That accession-level dedup **replaces time-window pagination entirely**. The window now only decides which days to look at, so there is no cutoff arithmetic left to get wrong.
+
+Most Form 4s are grants, option exercises and sales; only a small fraction are open-market purchases. The bot downloads them all and discards the rest — that is the cost of free data, and it is why `MAX_FILINGS_PER_RUN` exists.
+
+### Fixed along the way
+
+| Bug | Fix |
+|---|---|
+| Wrong endpoint, wrong field paths, nested query object | N/A — the whole sec-api layer is gone |
+| `datetime.utcnow()` compared against New York timestamps | No cutoff arithmetic at all; dedup by accession |
+| MarkdownV2 escaper never called with `parse_mode: HTML` | `html.escape()` on every dynamic field |
+| `sec_url` used the ticker as the CIK → every link 404'd | Built from the issuer CIK + accession |
+| Only the first `P` row per filing was read | Aggregates all `P`/`A` rows, share-weighted price |
+| 10b5-1 detected by string-matching the whole payload | `aff10b5One` element, with a footnote fallback |
+| Cluster compared dates to timestamps, counted filings, read only sent alerts | Dates to dates, distinct insiders, every recorded transaction |
+| `while True` on Colab, dies with the runtime | One cycle per invocation, optional `--loop` |
+| Credentials hardcoded | Environment variables only |
+| A capped or failed catch-up discarded all progress | Progress committed as it happens; the next run resumes |
+
+Added: adaptive lookback, cycle status messages, forum-topic routing, market-cap normalisation, seven hard filters, `--dry-run`, `--test-telegram`, `--test-edgar`, and 126 fixture tests.
 
 ---
 
@@ -53,7 +69,7 @@ Private repos work fine (2,000 Actions minutes/month on the Free plan; see [budg
 
 | Secret | Value |
 |---|---|
-| `SEC_API_KEY` | key from [sec-api.io](https://sec-api.io) |
+| `EDGAR_USER_AGENT` | `Your Name your@email.com` — required by the SEC |
 | `TELEGRAM_TOKEN` | token from @BotFather |
 | `TELEGRAM_CHAT_ID` | your chat id (supergroups start with `-100`) |
 | `TELEGRAM_TOPIC_ID` | **optional** — forum supergroups only |
@@ -77,7 +93,8 @@ Three ways to run it, in the order worth trying:
 
 | Input | What it does |
 |---|---|
-| `test_telegram: true` | sends one test message and logs **which chat and topic it landed in**. Start here |
+| `test_edgar: true` | fetches one daily index and reports what EDGAR returned. Start here |
+| `test_telegram: true` | sends one test message and logs **which chat and topic it landed in** |
 | `dry_run: true` | full cycle against live SEC data, alerts printed to the log only |
 | defaults | live |
 
@@ -115,9 +132,9 @@ The bot stores the last **successful** run in the `meta` table and derives the w
 - weekend (60h) → 60h window, truncated at `MAX_LOOKBACK_MINUTES` (3 days)
 - first ever run → `LOOKBACK_MINUTES` (90 min)
 
-The number of pages requested from the SEC-API scales with the window (`pages_for`), capped at `MAX_PAGES_CATCHUP` so a large catch-up cannot blow through your API quota.
+The window is converted to a list of weekdays, and each day's index is read once. Work is capped at `MAX_FILINGS_PER_RUN`; when the cap is hit, the run is **not** marked successful, so the next one picks up the remaining backlog instead of skipping it.
 
-This eliminates the "I lost filings because the cron did not fire" class of bug. The timestamp is written **after** a successful cycle — if the API fails, the next window covers the same period again.
+This eliminates the "I lost filings because the cron did not fire" class of bug. The timestamp is written **after** a fully drained cycle — if EDGAR fails, the next window covers the same period again.
 
 ## Status messages
 
@@ -157,8 +174,10 @@ Everything is optional except the three credentials.
 | `LOOKBACK_MINUTES` | `90` | cold-start window |
 | `LOOKBACK_BUFFER_MINUTES` | `25` | margin for cron delays |
 | `MAX_LOOKBACK_MINUTES` | `4320` | catch-up ceiling (3 days) |
-| `MAX_PAGES` | `6` | pages of 50 filings per run |
-| `MAX_PAGES_CATCHUP` | `30` | page ceiling during catch-up |
+| `MAX_FILINGS_PER_RUN` | `400` | download cap per run; a backlog carries over |
+| `EDGAR_USER_AGENT` | — | **required**; `Your Name you@email.com` |
+| `EDGAR_DELAY` | `0.15` | seconds between EDGAR requests (limit is 10/s) |
+| `INCLUDE_AMENDMENTS` | `false` | also process Form 4/A |
 | `STATUS_MESSAGES` | `off` | `always` / `summary` / `errors` / `off` |
 | `TELEGRAM_TOPIC_ID` | — | destination topic in forum supergroups |
 | `STATUS_TOPIC_ID` | — | separate topic for status messages |
@@ -234,7 +253,8 @@ Every alert carries its breakdown so you can audit why it fired.
 pip install -r requirements.txt
 python test_bot.py                       # 106 tests, no network
 
-export SEC_API_KEY="..."
+export EDGAR_USER_AGENT="Your Name you@email.com"
+python insider_bot.py --test-edgar       # is EDGAR reachable and is the UA accepted?
 python insider_bot.py --dry-run          # live data, prints instead of sending
 
 export TELEGRAM_TOKEN="..." TELEGRAM_CHAT_ID="..."
@@ -274,12 +294,11 @@ These are not bugs — they are properties of the signal. They matter more than 
 ## Roadmap
 
 - **Phase 2 — enrich:** market cap (yfinance), price vs 50/200-day MA, capture sales (`S`), group same-day filings by ticker
-- **Phase 3 — backtest:** sec-api bulk archives (`/bulk/form-4/YYYY/YYYY-MM.jsonl.gz`) + historical prices; returns at 1/5/21/63/126 days per score bucket. This answers whether the score is worth anything
+- **Phase 3 — backtest:** EDGAR full-index archives + historical prices; returns at 1/5/21/63/126 days per score bucket. This answers whether the score is worth anything
 - **Phase 4 — signals:** only if Phase 3 shows an edge. Explicit entry and exit, position sizing, and paper trading before real money
 
 ## Sources
 
-- [Insider Trading Data from SEC Form 3, 4, 5 Filings — sec-api.io](https://sec-api.io/docs/insider-ownership-trading-api)
-- [Analyze SEC Form 4 Insider Trades with Python — sec-api.io](https://sec-api.io/docs/insider-ownership-trading-api/python-example)
-- [Form 4 Bulk Dataset — sec-api.io](https://sec-api.io/datasets/form-4)
+- [Accessing EDGAR Data — SEC.gov](https://www.sec.gov/os/accessing-edgar-data)
+- [EDGAR daily index files](https://www.sec.gov/Archives/edgar/daily-index/)
 - [GitHub Actions billing — GitHub Docs](https://docs.github.com/billing/managing-billing-for-github-actions/about-billing-for-github-actions)
