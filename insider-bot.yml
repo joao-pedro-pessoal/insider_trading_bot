@@ -1,0 +1,170 @@
+name: Insider Alert Bot
+
+on:
+  schedule:
+    # Times are UTC. New York = UTC-4 (summer) / UTC-5 (winter).
+    #
+    # Budget: ~28 runs per weekday, ~590/month. At 1-2 billed minutes each,
+    # that lands at 600-1200 of the 2000 min/month included on the Free plan.
+    #
+    # The frequency is deliberately low. Form 4 has a two-business-day filing
+    # deadline and becomes public to everyone at the same moment. Arriving 20
+    # minutes later changes nothing for a signal measured in months. The
+    # adaptive lookback guarantees that wider gaps do not lose filings.
+
+    # Market hours: 13:00-19:59 UTC (09:00-15:59 ET), every 30min = 14
+    - cron: "*/30 13-19 * * 1-5"
+    # Post-close, the real filing peak: 20:00-22:59 UTC (16:00-18:59 ET), every 15min = 12
+    - cron: "*/15 20-22 * * 1-5"
+    # Catches the rest of the US evening (EDGAR accepts filings until 22:00 ET) = 1
+    - cron: "25 2 * * 2-6"
+    # Saturday catch-up for Friday-night filings = 1
+    - cron: "25 5 * * 6"
+
+  workflow_dispatch:
+    inputs:
+      lookback:
+        description: "Force window in minutes (empty = automatic)"
+        required: false
+        default: ""
+      dry_run:
+        description: "true = do not send to Telegram, just print to the log"
+        required: false
+        default: "false"
+      test_telegram:
+        description: "true = send one test message and report where it landed"
+        required: false
+        default: "false"
+      test_edgar:
+        description: "true = fetch one EDGAR daily index and report what came back"
+        required: false
+        default: "false"
+
+# Prevents two runs writing to the same database at once
+concurrency:
+  group: insider-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # required to persist the SQLite state
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      # The SQLite file lives on an orphan 'bot-state' branch so the code
+      # history is not polluted with binary diffs.
+      - name: Restore state
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+            git fetch origin bot-state --depth=1
+            git show origin/bot-state:alerts.db > state/alerts.db 2>/dev/null || true
+            echo "State restored ($(stat -c%s state/alerts.db 2>/dev/null || echo 0) bytes)"
+          else
+            echo "No bot-state branch yet - cold start"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the bot
+        env:
+          # EDGAR requires a User-Agent identifying you, with a contact email.
+          # Requests without one are blocked. Format: "Your Name you@email.com"
+          EDGAR_USER_AGENT:  ${{ secrets.EDGAR_USER_AGENT }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+          # ── Hard filters (applied before scoring) ──────────────
+          MIN_TRANSACTION_VALUE_USD: "25000"
+          MIN_PRICE: "1.0"            # skip penny stocks, the biggest noise source
+          EXCLUDE_10B5: "false"       # true = drop scheduled plan purchases entirely
+          REQUIRE_DIRECT: "false"     # true = personal holdings only, no trusts/LLCs
+          MIN_POSITION_INCREASE: "0"  # e.g. 10 = require a 10% bigger stake
+          MIN_MARKET_CAP: "0"         # e.g. 50000000 for $50M floor
+          MAX_MARKET_CAP: "0"         # e.g. 10000000000 to skip mega caps
+          # ONLY_TICKERS: "NVDA,AMD"  # watchlist mode
+          # EXCLUDE_TICKERS: "XYZ"
+
+          # ── Scoring ───────────────────────────────────────────
+          CLUSTER_WINDOW_DAYS: "7"
+          SCORE_MIN_TO_SEND: "9"      # only alert on score 9+ out of ~22
+          SCORE_SILENT_BELOW: "10"    # 9 arrives silently
+          SCORE_MAX_ALERT_FROM: "13"  # 13+ is a MAX ALERT
+          # Set to 3 to demote automatic 10b5-1 plan purchases
+          SCORE_PENALTY_10B5: "0"
+          # Market cap + 52-week context via yfinance. Degrades gracefully.
+          ENABLE_MARKET_DATA: "true"
+          # Cycle start/finish messages: always | summary | errors | off
+          STATUS_MESSAGES: "always"
+          # Separate topic for status messages (empty = alongside the alerts)
+          STATUS_TOPIC_ID: ${{ secrets.STATUS_TOPIC_ID }}
+          # Cold start only; afterwards the window is derived from the last run
+          LOOKBACK_MINUTES: "90"
+          # Filings downloaded per run. Caps runtime; a backlog carries over.
+          MAX_FILINGS_PER_RUN: "400"
+        run: |
+          if [ "${{ github.event.inputs.test_edgar }}" = "true" ]; then
+            python insider_bot.py --test-edgar
+            exit $?
+          fi
+          if [ "${{ github.event.inputs.test_telegram }}" = "true" ]; then
+            python insider_bot.py --test-telegram
+            exit $?
+          fi
+
+          ARGS="--db state/alerts.db"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ github.event.inputs.lookback }}" ]; then
+            ARGS="$ARGS --lookback ${{ github.event.inputs.lookback }}"
+          fi
+          python insider_bot.py $ARGS
+
+      - name: Persist state
+        if: always()
+        run: |
+          if [ ! -f state/alerts.db ]; then
+            echo "No database to persist"; exit 0
+          fi
+          git config user.name  "insider-bot"
+          git config user.email "insider-bot@users.noreply.github.com"
+
+          TMP=$(mktemp -d)
+          cp state/alerts.db "$TMP/alerts.db"
+
+          git checkout --orphan bot-state-tmp
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          find . -maxdepth 1 ! -name . ! -name .git ! -name state -exec rm -rf {} +
+          cp "$TMP/alerts.db" alerts.db
+
+          git add -f alerts.db
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 0
+          git push --force origin HEAD:bot-state
+
+      # Artifacts on failure only. Uploading on every run created ~900 live
+      # artifacts at once and blew through the 500 MB Free-plan storage limit.
+      # The bot-state branch is the day-to-day backup.
+      - name: Upload database on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alerts-db-${{ github.run_id }}
+          path: state/alerts.db
+          retention-days: 5
+          if-no-files-found: ignore
