@@ -415,18 +415,28 @@ def _edgar_get(url: str) -> Optional[str]:
             if resp.status_code == 429:
                 raise RateLimitError(f"EDGAR rate limit (429) on {url}")
             if resp.status_code == 403:
-                # The SEC's block page explains which rule was tripped. Log it:
-                # "undeclared automated tool" means the User-Agent, anything
-                # about request rates means the IP is throttled. Guessing
-                # between those two costs far more than printing the body.
-                body = " ".join(resp.text.split())[:400]
+                # Two very different things arrive as 403.
+                #
+                # 1. S3 answers "AccessDenied" for objects that do not exist,
+                #    because the bucket does not grant ListBucket. A daily
+                #    index that has not been published yet looks exactly like
+                #    this, and it is not an error -- it is "come back later".
+                # 2. EDGAR's own block page is HTML and says "undeclared
+                #    automated tool". That one really is a rejected
+                #    User-Agent, and retrying will never help.
+                text = resp.text or ""
+                if "AccessDenied" in text and "<Error>" in text:
+                    log.debug("not published yet (S3 AccessDenied): %s", url)
+                    return None
+
+                body = " ".join(text.split())[:400]
                 log.error("EDGAR 403. Response body: %s", body or "(empty)")
-                log.error("User-Agent diagnostics: %s",
-                          _describe_user_agent())
+                log.error("User-Agent diagnostics: %s", _describe_user_agent())
                 raise RuntimeError(
-                    "EDGAR returned 403. See the response body logged above: "
-                    "'undeclared automated tool' means EDGAR_USER_AGENT is "
-                    "wrong; a rate message means the IP is being throttled."
+                    "EDGAR returned 403 and it is not a missing file. "
+                    "'undeclared automated tool' in the body above means "
+                    "EDGAR_USER_AGENT is wrong; a rate message means the IP "
+                    "is being throttled."
                 )
             resp.raise_for_status()
             return resp.text
