@@ -381,10 +381,11 @@ def _edgar_get(url: str) -> Optional[str]:
     One EDGAR request, rate-limited and retried. Returns None on 404 (a missing
     daily index for a holiday is normal, not an error).
     """
+    # No explicit Host header: requests derives it from the URL, and setting it
+    # by hand only creates a way for it to be wrong.
     headers = {
         "User-Agent": EDGAR_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov",
     }
     last_error: Optional[Exception] = None
 
